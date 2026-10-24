@@ -89,7 +89,7 @@
     <section>
       <h2 id="vllm-title">vLLM</h2>
       <div id="vllm-model" class="daemon-stats"></div>
-      <div id="vllm"></div>
+      <div id="vllm-load"></div>
       <div id="vllm-chart-wrap" class="subgroup" style="display:none">
         <div class="subhead">History
           <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· one point per refresh</span>
@@ -97,6 +97,7 @@
         </div>
         <canvas id="vllm-chart"></canvas>
       </div>
+      <div id="vllm-rest"></div>
       <div id="vllm-empty" class="muted"></div>
     </section>
 
@@ -219,9 +220,9 @@
     }
 
     function renderVllm(v) {
-      const model = $("vllm-model"), root = $("vllm"), empty = $("vllm-empty");
+      const model = $("vllm-model"), load = $("vllm-load"), rest = $("vllm-rest"), empty = $("vllm-empty");
       if (!v || !v.ok) {
-        model.innerHTML = ""; root.innerHTML = "";
+        model.innerHTML = ""; load.innerHTML = ""; rest.innerHTML = "";
         empty.textContent = v && v.error ? `vLLM: ${v.error}` : "No vLLM data.";
         return;
       }
@@ -254,8 +255,8 @@
         loadCards.push(stat("Failed requests", num(v.requests_failed),
           v.requests_failed > 0 ? "bad" : ""));
       }
-      root.innerHTML =
-        group("Load & queue", loadCards) +
+      load.innerHTML = group("Load & queue", loadCards);
+      rest.innerHTML =
         group("Throughput", [
           stat("Output", u(v.output_tokens_per_sec, " tok/s")),
           stat("Input", u(v.input_tokens_per_sec, " tok/s")),
