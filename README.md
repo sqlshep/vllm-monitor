@@ -30,6 +30,8 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 - **Host** — CPU, load, RAM/swap, disk, network, uptime
 - **Docker** — container health/status plus per-container CPU/memory
 
+![vLLM Monitor dashboard](docs/dashboard.png)
+
 ---
 
 ## Architecture
