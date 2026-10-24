@@ -33,7 +33,7 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 - **Host** — CPU, load, RAM/swap, disk, network, uptime
 - **Docker** — container health/status plus per-container CPU/memory
 
-![LLM Server Monitor dashboard](docs/dashboard.png?v=2)
+![LLM Server Monitor dashboard](docs/dashboard.png?v=3)
 
 ---
 
