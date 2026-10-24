@@ -92,7 +92,7 @@
       <div id="vllm-load"></div>
       <div id="vllm-chart-wrap" class="subgroup" style="display:none">
         <div class="subhead">History
-          <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· one point per refresh</span>
+          <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· rolling · one point per refresh · last 200</span>
           <span id="vllm-chart-legend" class="chart-legend"></span>
         </div>
         <canvas id="vllm-chart"></canvas>
@@ -100,7 +100,7 @@
       <div id="vllm-throughput"></div>
       <div id="thpt-chart-wrap" class="subgroup" style="display:none">
         <div class="subhead">History
-          <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· one point per refresh</span>
+          <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· rolling · one point per refresh · last 200</span>
           <span id="thpt-chart-legend" class="chart-legend"></span>
         </div>
         <canvas id="thpt-chart"></canvas>
@@ -395,7 +395,7 @@
     }
 
     // ---- Serving history chart (lines: running/waiting/KV%; bars: failed/interval) ----
-    const CHART_MAX = 120;              // keep the last N refresh ticks
+    const CHART_MAX = 200;              // rolling window: keep the last N refresh ticks (oldest scrolls off)
     const vllmHistory = [];
     let vllmPrevFailed = null;
 
