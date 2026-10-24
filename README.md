@@ -54,12 +54,12 @@ flowchart LR
         docker[("Docker daemon")]
         gpu["NVIDIA GPU"]
         host["Host kernel<br/>/proc · /host"]
-        vllm["vLLM container :8000"]
+        engine["Inference engine :8000<br/>vLLM or NVIDIA NIM<br/>(auto-detected)"]
 
         agent -->|"docker.sock (ro)"| docker
         agent -->|"nvidia-smi"| gpu
         agent -->|"read /proc, /host (ro)"| host
-        agent -->|"scrape /metrics"| vllm
+        agent -->|"scrape /metrics<br/>or /v1/metrics"| engine
     end
 
     dashboard ==>|"GET /api/all · Bearer token · HTTP :9100"| agent
@@ -81,8 +81,8 @@ only client, polling it with a bearer token over the public IP.
 |---|---|---|
 | **Docker** containers + per-container stats | Docker SDK via the mounted `/var/run/docker.sock` (read-only) | The socket is local to the host. |
 | **GPU** stats, throttle, ECC, PCIe, processes | Runs `nvidia-smi` | Needs the GPU + driver, injected by the NVIDIA Container Toolkit. |
-| **vLLM** serving metrics | Scrapes vLLM's Prometheus endpoint at `http://localhost:8000/metrics` | vLLM binds to `127.0.0.1`; reachable only via host networking. |
-| **vLLM** config | `docker inspect` on the vLLM container | Reads the actual launched command + runtime flags. |
+| **Serving** metrics (vLLM / NIM) | Scrapes the engine's Prometheus endpoint (`/metrics` for vLLM, `/v1/metrics` for NIM — both auto-tried) | The engine binds to `127.0.0.1:8000`; reachable only via host networking. |
+| **Serving** config | `docker inspect` on the running inference container | Reads the actual launched command + runtime flags; the engine (vLLM/NIM/…) is auto-detected from the image. |
 | **Host** CPU / mem / net / uptime | Reads `/proc` | Host-visible because the container shares the host PID namespace. |
 | **Host** disk usage | `statvfs` on a read-only bind mount of `/` at `/host` | The container's own filesystem isn't the host's. |
 
@@ -97,7 +97,7 @@ only ever exposes status, never control.
 
 1. The browser polls the dashboard's `/api/status` every few seconds.
 2. The dashboard calls the agent's `GET /api/all` with the bearer token over the public IP.
-3. The agent gathers Docker + GPU + vLLM + host data on the instance and returns one JSON snapshot.
+3. The agent gathers Docker + GPU + serving (vLLM/NIM) + host data on the instance and returns one JSON snapshot.
 4. The dashboard returns it to the browser, which renders the sections.
 
 Rate-based values (token throughput, CPU %, network throughput) are computed from
