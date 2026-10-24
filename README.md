@@ -27,7 +27,7 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 
 **What it shows, in one dashboard:**
 
-- **Serving metrics** — throughput, latency percentiles, queue depth, KV-cache, prefix-cache hit rate
+- **Serving metrics** — throughput, latency percentiles, queue depth, KV-cache, prefix-cache hit rate, plus a live history chart (running/waiting/KV %, with failed-request bars)
 - **Launch configuration** — the serving container's engine args and runtime flags
 - **GPU** — utilization, memory, temperature, power, clocks, PCIe, throttle reasons, ECC, per-process usage
 - **Host** — CPU, load, RAM/swap, disk, network, uptime

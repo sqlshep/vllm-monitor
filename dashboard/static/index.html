@@ -60,6 +60,11 @@
     table th { color: var(--muted); font-weight: 600; }
     code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
            background: #21262d; padding: 1px 6px; border-radius: 4px; color: #e6edf3; }
+    #vllm-chart { width: 100%; height: 190px; display: block;
+                  background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+    .chart-legend { font-weight: 400; text-transform: none; letter-spacing: 0; }
+    .chart-legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+                        margin: 0 4px 0 12px; vertical-align: middle; }
   </style>
 </head>
 <body>
@@ -85,6 +90,13 @@
       <h2 id="vllm-title">vLLM</h2>
       <div id="vllm-model" class="daemon-stats"></div>
       <div id="vllm"></div>
+      <div id="vllm-chart-wrap" class="subgroup" style="display:none">
+        <div class="subhead">History
+          <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· one point per refresh</span>
+          <span id="vllm-chart-legend" class="chart-legend"></span>
+        </div>
+        <canvas id="vllm-chart"></canvas>
+      </div>
       <div id="vllm-empty" class="muted"></div>
     </section>
 
@@ -371,6 +383,102 @@
       </div>`;
     }
 
+    // ---- Serving history chart (lines: running/waiting/KV%; bars: failed/interval) ----
+    const CHART_MAX = 120;              // keep the last N refresh ticks
+    const vllmHistory = [];
+    let vllmPrevFailed = null;
+
+    function recordVllm(v) {
+      let failedDelta = 0;
+      const hasFailed = v.requests_failed != null;
+      if (hasFailed) {
+        if (vllmPrevFailed != null) failedDelta = Math.max(0, v.requests_failed - vllmPrevFailed);
+        vllmPrevFailed = v.requests_failed;
+      }
+      vllmHistory.push({
+        running: v.requests_running ?? 0,
+        waiting: v.requests_waiting ?? 0,
+        kv: v.kv_cache_usage_pct ?? 0,
+        failed: failedDelta,
+        hasFailed,
+      });
+      if (vllmHistory.length > CHART_MAX) vllmHistory.shift();
+    }
+
+    function niceMax(v) {
+      if (v <= 1) return 1;
+      const pow = Math.pow(10, Math.floor(Math.log10(v)));
+      const n = v / pow;
+      const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+      return step * pow;
+    }
+
+    function drawVllmChart() {
+      const wrap = $("vllm-chart-wrap"), cv = $("vllm-chart");
+      if (vllmHistory.length < 2) { wrap.style.display = "none"; return; }
+      wrap.style.display = "block";
+
+      const anyFailed = vllmHistory.some((d) => d.hasFailed);
+      const sw = (c) => `<span class="sw" style="background:${c}"></span>`;
+      $("vllm-chart-legend").innerHTML =
+        sw("#58a6ff") + "Running" + sw("#d29922") + "Waiting" + sw("#3fb950") + "KV %" +
+        (anyFailed ? sw("#f85149") + "Failed/interval" : "");
+
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = cv.clientWidth || cv.parentElement.clientWidth || 600;
+      const cssH = 190;
+      cv.width = Math.round(cssW * dpr);
+      cv.height = Math.round(cssH * dpr);
+      const ctx = cv.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      const padL = 34, padR = 40, padT = 12, padB = 16;
+      const w = cssW - padL - padR, h = cssH - padT - padB;
+      const n = vllmHistory.length;
+
+      let cntMax = 1;
+      vllmHistory.forEach((d) => { cntMax = Math.max(cntMax, d.running, d.waiting, d.failed); });
+      cntMax = niceMax(cntMax);
+
+      const x = (i) => padL + (n === 1 ? 0 : (i / (n - 1)) * w);
+      const yL = (val) => padT + h - (val / cntMax) * h;             // counts (left)
+      const yR = (pct) => padT + h - (Math.min(pct, 100) / 100) * h; // KV % (right)
+
+      ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.lineWidth = 1;
+      for (let g = 0; g <= 4; g++) {
+        const yy = padT + h - (g / 4) * h;
+        ctx.strokeStyle = "#30363d"; ctx.globalAlpha = 0.4;
+        ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + w, yy); ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = "#8b949e"; ctx.textAlign = "right";
+        ctx.fillText(String(Math.round((cntMax * g) / 4)), padL - 5, yy + 3);
+        ctx.fillStyle = "#3fb950"; ctx.textAlign = "left";
+        ctx.fillText(25 * g + "%", padL + w + 5, yy + 3);
+      }
+
+      if (anyFailed) {
+        const bw = Math.max(1, (w / n) * 0.6);
+        ctx.fillStyle = "rgba(248,81,73,.55)";
+        vllmHistory.forEach((d, i) => {
+          if (d.failed > 0) { const by = yL(d.failed); ctx.fillRect(x(i) - bw / 2, by, bw, padT + h - by); }
+        });
+      }
+
+      const line = (key, color, yfn) => {
+        ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.beginPath();
+        vllmHistory.forEach((d, i) => {
+          const px = x(i), py = yfn(d[key]);
+          i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+        });
+        ctx.stroke();
+      };
+      line("running", "#58a6ff", yL);
+      line("waiting", "#d29922", yL);
+      line("kv", "#3fb950", yR);
+    }
+
     async function poll() {
       try {
         const r = await fetch("/api/status", { cache: "no-store" });
@@ -388,6 +496,7 @@
         $("vllm-title").textContent = engine;
         $("vcfg-title").textContent = engine + " Configuration";
         renderVllm(data.vllm);
+        if (data.vllm && data.vllm.ok) { recordVllm(data.vllm); drawVllmChart(); }
         renderGpu(data.gpu);
         renderHost(data.host);
         renderDocker(data.docker);
@@ -405,6 +514,11 @@
       timer = setInterval(poll, parseInt($("interval").value, 10));
     }
     $("interval").addEventListener("change", restart);
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(drawVllmChart, 150);
+    });
     restart();
   </script>
 </body>
