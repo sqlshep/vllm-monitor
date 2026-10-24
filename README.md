@@ -33,7 +33,7 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 - **Host** — CPU, load, RAM/swap, disk, network, uptime
 - **Docker** — container health/status plus per-container CPU/memory
 
-![vLLM Monitor dashboard](docs/dashboard.png)
+![LLM Server Monitor dashboard](docs/dashboard.png)
 
 ---
 
@@ -111,7 +111,7 @@ under load.
 ```
 NvidiaPrep/
 ├── agent/                      # runs ON the GPU instance
-│   ├── app.py                  # FastAPI: Docker, GPU, vLLM, host collectors
+│   ├── app.py                  # FastAPI: Docker, GPU, serving (vLLM/NIM), host collectors
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── dashboard/                  # runs on your laptop
@@ -135,15 +135,17 @@ NvidiaPrep/
 | `GET /api/host` | Bearer | CPU, load, RAM/swap, disk, network, uptime, volume sizes |
 | `GET /api/gpu` | Bearer | Per-GPU utilization/memory/temp/power/clocks/PCIe/throttle/ECC + compute apps |
 | `GET /api/docker` | Bearer | Daemon info + containers (status/health + per-container CPU/mem/net) |
-| `GET /api/vllm` | Bearer | vLLM serving metrics (throughput, latency percentiles, KV/prefix cache, …) |
-| `GET /api/vllm-config` | Bearer | vLLM container launch config (engine args + runtime flags) |
+| `GET /api/vllm` | Bearer | Serving metrics — vLLM or NIM (throughput, latency percentiles, KV/prefix cache, …) |
+| `GET /api/vllm-config` | Bearer | Serving container launch config (engine args + runtime flags; engine auto-detected) |
 | `GET /api/all` | Bearer | Combined snapshot — what the dashboard consumes |
 
 ### Metrics reference
 
-**vLLM** — requests running/waiting, KV-cache %, input/output tokens/sec, avg TTFT,
-inter-token latency, total latency P50/P95/P99, preemptions, prefix-cache hit rate,
-avg prompt/output tokens per request, lifetime token totals, finished requests.
+**Serving (vLLM / NIM)** — requests running/waiting, KV-cache %, input/output
+tokens/sec, avg TTFT, inter-token latency, total latency P50/P95/P99, preemptions,
+prefix-cache hit rate, avg prompt/output tokens per request, lifetime token totals,
+finished requests, plus NIM-only max-concurrent capacity and failed-request count.
+The serving engine is auto-detected and the dashboard labels itself accordingly.
 
 **GPU** — utilization, memory used/total/%, temperature, power draw/limit, fan,
 SM/mem clocks, P-state, PCIe gen/width, driver version, uncorrected ECC errors,
@@ -162,7 +164,7 @@ CPU %, memory used/%, plus daemon summary.
 ### Prerequisites
 
 - **Instance:** Docker, Docker Compose v2, and the **NVIDIA Container Toolkit**
-  (already present if vLLM runs in Docker with GPUs).
+  (already present if your engine runs in Docker with GPUs).
 - **Laptop:** Docker (or Python 3.12) and the `gcloud` CLI for SSH/SCP.
 
 ### 1. Deploy the agent (on the GPU instance)
@@ -179,7 +181,7 @@ curl -s -H "Authorization: Bearer $AGENT_TOKEN" localhost:9100/api/all | head
 
 The agent compose grants exactly what each collector needs and nothing more:
 
-- `network_mode: host` — reach vLLM on `127.0.0.1:8000`, and publish port `9100`
+- `network_mode: host` — reach the engine on `127.0.0.1:8000`, and publish port `9100`
 - `pid: "host"` — resolve GPU process names (e.g. `VLLM::EngineCore`)
 - `/var/run/docker.sock:ro` — inspect containers (read-only)
 - `/:/host:ro` — read host disk usage
@@ -235,7 +237,7 @@ docker restart vllm-monitor-agent
 **After stopping/starting the GCP instance:**
 
 - The **agent** auto-starts on boot (`restart: unless-stopped`).
-- The **vLLM container** does **not** auto-start if its restart policy is `no` — start it manually.
+- The **inference container** (vLLM/NIM) does **not** auto-start if its restart policy is `no` — start it manually.
 - If the instance uses an **ephemeral external IP**, it changes on restart — update
   `AGENT_URL` in `.env` and bring the dashboard back up. (Reserve a static IP to avoid this.)
 
@@ -247,7 +249,7 @@ docker restart vllm-monitor-agent
   `ro`; the agent inspects but never controls anything.
 - **Token-gated:** every data endpoint requires a bearer token (constant-time compared);
   the token lives only on the agent and the dashboard server, never in the browser.
-- **No secrets leaked:** the vLLM config collector intentionally omits the container's
+- **No secrets leaked:** the serving config collector intentionally omits the container's
   environment variables (which may contain `HF_TOKEN` and similar).
 - **Network-scoped:** the firewall rule allows `9100` only from your source IP.
 
@@ -266,4 +268,4 @@ docker restart vllm-monitor-agent
 
 Python 3.12 · FastAPI · Uvicorn · Docker SDK · `nvidia-smi` · vanilla HTML/CSS/JS
 (no frontend build step). The agent uses only the standard library for `/proc`,
-disk, and vLLM-metrics parsing — no extra scraping dependencies.
+disk, and serving-metrics parsing — no extra scraping dependencies.
