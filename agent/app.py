@@ -510,6 +510,11 @@ def collect_vllm() -> dict[str, Any]:
         "avg_output_tokens_per_req": avg("vllm:request_generation_tokens_sum",
                                          "vllm:request_generation_tokens_count", nd=0),
         "requests_finished": _sum_metric(parsed, "vllm:request_success_total"),
+        # NIM-specific (absent on vLLM; left null there so the UI hides them):
+        #   num_request_max   -> configured max concurrent requests (capacity)
+        #   request_failure_total -> explicit failed-request counter
+        "max_concurrent": _sum_metric(parsed, "num_request_max"),
+        "requests_failed": _sum_metric(parsed, "request_failure_total"),
     }
 
 

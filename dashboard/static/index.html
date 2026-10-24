@@ -223,13 +223,27 @@
       const kvCls = kv >= 90 ? "bad" : kv >= 70 ? "warn" : "";
       const waitCls = v.requests_waiting > 0 ? "warn" : "";
       const preemptCls = v.preemptions_total > 0 ? "warn" : "";
+      const loadCards = [
+        stat("Requests running", num(v.requests_running)),
+        stat("Requests waiting", num(v.requests_waiting), waitCls),
+      ];
+      // NIM-only: configured concurrency capacity (vLLM leaves this null).
+      if (v.max_concurrent != null) {
+        const busy = v.requests_running != null
+          ? Math.round((v.requests_running / v.max_concurrent) * 100) : null;
+        loadCards.push(stat("Max concurrent", num(v.max_concurrent)
+          + (busy != null ? ` (${busy}%)` : ""),
+          busy >= 90 ? "bad" : busy >= 70 ? "warn" : ""));
+      }
+      loadCards.push(stat("KV cache", u(kv, "%"), kvCls));
+      loadCards.push(stat("Preemptions", num(v.preemptions_total), preemptCls));
+      // NIM-only: explicit failed-request counter (vLLM leaves this null).
+      if (v.requests_failed != null) {
+        loadCards.push(stat("Failed requests", num(v.requests_failed),
+          v.requests_failed > 0 ? "bad" : ""));
+      }
       root.innerHTML =
-        group("Load & queue", [
-          stat("Requests running", num(v.requests_running)),
-          stat("Requests waiting", num(v.requests_waiting), waitCls),
-          stat("KV cache", u(kv, "%"), kvCls),
-          stat("Preemptions", num(v.preemptions_total), preemptCls),
-        ]) +
+        group("Load & queue", loadCards) +
         group("Throughput", [
           stat("Output", u(v.output_tokens_per_sec, " tok/s")),
           stat("Input", u(v.input_tokens_per_sec, " tok/s")),
