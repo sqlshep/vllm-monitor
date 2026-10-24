@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>vLLM Monitor</title>
+  <title>LLM Server Monitor</title>
   <style>
     :root {
       --bg: #0d1117; --panel: #161b22; --border: #30363d;
@@ -64,7 +64,7 @@
 </head>
 <body>
   <header>
-    <h1>🖥️ vLLM Monitor</h1>
+    <h1>🖥️ LLM Server Monitor</h1>
     <span id="conn" class="pill muted"><span class="dot"></span>connecting…</span>
     <div class="spacer"></div>
     <label class="meta">refresh
@@ -82,7 +82,7 @@
     <div id="error" class="error" style="display:none"></div>
 
     <section>
-      <h2>vLLM</h2>
+      <h2 id="vllm-title">vLLM</h2>
       <div id="vllm-model" class="daemon-stats"></div>
       <div id="vllm"></div>
       <div id="vllm-empty" class="muted"></div>
@@ -113,7 +113,7 @@
     </section>
 
     <section>
-      <h2>vLLM Configuration</h2>
+      <h2 id="vcfg-title">Configuration</h2>
       <div id="vcfg-runtime" class="daemon-stats"></div>
       <div id="vcfg" class="grid" style="grid-template-columns: 1fr;"></div>
       <div id="vcfg-empty" class="muted"></div>
@@ -370,6 +370,9 @@
         $("error").style.display = "none";
         setConn("ok", "live");
         $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+        const engine = (data.vllm_config && data.vllm_config.engine) || "LLM";
+        $("vllm-title").textContent = engine;
+        $("vcfg-title").textContent = engine + " Configuration";
         renderVllm(data.vllm);
         renderGpu(data.gpu);
         renderHost(data.host);

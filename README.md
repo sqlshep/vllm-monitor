@@ -1,10 +1,13 @@
-# vLLM Monitor
+# LLM Server Monitor
 
-**vLLM Monitor is a lightweight, self-hosted observability tool for a GPU server
-running [vLLM](https://github.com/vllm-project/vllm) in Docker.** It gives you a
-single pane of glass over the whole inference stack — the model server, the GPU,
-the containers, and the host machine — without the weight of a full Prometheus +
-Grafana deployment.
+**LLM Server Monitor is a lightweight, self-hosted observability tool for a GPU
+server running an LLM inference engine in Docker — [vLLM](https://github.com/vllm-project/vllm)
+or [NVIDIA NIM](https://developer.nvidia.com/nim).** It gives you a single pane of
+glass over the whole inference stack — the model server, the GPU, the containers,
+and the host machine — without the weight of a full Prometheus + Grafana deployment.
+
+The engine is **auto-detected**: point it at a box running vLLM or NIM and the
+dashboard labels itself accordingly (both expose the same vLLM-family metrics).
 
 Running an LLM on a cloud GPU instance leaves you with blind spots: Is the server
 keeping up, or is a request queue forming? Is the GPU actually busy, or silently
@@ -24,8 +27,8 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 
 **What it shows, in one dashboard:**
 
-- **vLLM serving metrics** — throughput, latency percentiles, queue depth, KV-cache, prefix-cache hit rate
-- **vLLM launch configuration** — the exact engine args and container runtime flags
+- **Serving metrics** — throughput, latency percentiles, queue depth, KV-cache, prefix-cache hit rate
+- **Launch configuration** — the serving container's engine args and runtime flags
 - **GPU** — utilization, memory, temperature, power, clocks, PCIe, throttle reasons, ECC, per-process usage
 - **Host** — CPU, load, RAM/swap, disk, network, uptime
 - **Docker** — container health/status plus per-container CPU/memory
@@ -254,8 +257,8 @@ docker restart vllm-monitor-agent
 |---|---|---|---|
 | `AGENT_TOKEN` | agent + dashboard | — (required) | Shared bearer secret |
 | `AGENT_URL` | dashboard | — (required) | `http://<instance-ip>:9100` |
-| `VLLM_METRICS_URL` | agent | `http://localhost:8000/metrics` | vLLM Prometheus endpoint |
-| `VLLM_CONTAINER` | agent | `vllm` | Container to inspect for config (falls back to any `vllm`-named image) |
+| `VLLM_METRICS_URL` | agent | `http://localhost:8000/metrics` | Serving-metrics endpoint. Auto-tries the alternate path too, so NIM's `/v1/metrics` works without changes. |
+| `VLLM_CONTAINER` | agent | `vllm` | Hint for the serving container to inspect. The agent prefers whichever inference container is actually *running* (vLLM, NIM, TensorRT-LLM, TGI, SGLang). |
 
 ---
 

@@ -334,8 +334,20 @@ def _parse_prometheus(text: str) -> dict[str, list[tuple[str, float]]]:
     return out
 
 
+def _resolve(parsed: dict, name: str):
+    """Look up a metric by canonical vLLM name, tolerating backends (e.g. NVIDIA
+    NIM) that emit the same metrics WITHOUT the `vllm:` prefix."""
+    if name in parsed:
+        return parsed[name]
+    if name.startswith("vllm:"):
+        bare = name[len("vllm:"):]
+        if bare in parsed:
+            return parsed[bare]
+    return None
+
+
 def _sum_metric(parsed: dict, name: str) -> float | None:
-    series = parsed.get(name)
+    series = _resolve(parsed, name)
     if not series:
         return None
     return sum(v for _, v in series)
@@ -345,7 +357,7 @@ def _histogram_quantile(parsed: dict, name: str, q: float) -> float | None:
     """Estimate a quantile from Prometheus histogram buckets (like PromQL
     histogram_quantile). Aggregates bucket counts across label sets so it works
     with multiple engines/models."""
-    series = parsed.get(name + "_bucket")
+    series = _resolve(parsed, name + "_bucket")
     if not series:
         return None
     agg: dict[float, float] = {}
@@ -379,17 +391,39 @@ def _histogram_quantile(parsed: dict, name: str, q: float) -> float | None:
 _vllm_prev: dict[str, float] = {}
 
 
-def collect_vllm() -> dict[str, Any]:
-    try:
-        req = urllib.request.Request(VLLM_METRICS_URL, headers={"Accept": "text/plain"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            text = resp.read().decode("utf-8", "replace")
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"could not scrape {VLLM_METRICS_URL}: {exc}"}
+def _vllm_metric_urls() -> list[str]:
+    """Configured URL plus the alternate path, so we auto-detect both vLLM
+    (`/metrics`) and NVIDIA NIM (`/v1/metrics`) without reconfiguration."""
+    urls = [VLLM_METRICS_URL]
+    if VLLM_METRICS_URL.endswith("/v1/metrics"):
+        urls.append(VLLM_METRICS_URL[: -len("/v1/metrics")] + "/metrics")
+    elif VLLM_METRICS_URL.endswith("/metrics"):
+        urls.append(VLLM_METRICS_URL[: -len("/metrics")] + "/v1/metrics")
+    return urls
 
-    parsed = _parse_prometheus(text)
-    if not parsed:
-        return {"ok": False, "error": "no vLLM metrics found at endpoint"}
+
+def collect_vllm() -> dict[str, Any]:
+    parsed = None
+    last_err = None
+    for url in _vllm_metric_urls():
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "text/plain"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                text = resp.read().decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"could not scrape {url}: {exc}"
+            continue
+        candidate = _parse_prometheus(text)
+        # Accept the endpoint only if it actually carries serving metrics
+        # (prefix-agnostic), so a 404 body or wrong port is rejected.
+        if _resolve(candidate, "vllm:num_requests_running") is not None or \
+           _resolve(candidate, "vllm:generation_tokens_total") is not None:
+            parsed = candidate
+            break
+        last_err = f"no vLLM/NIM serving metrics at {url}"
+
+    if parsed is None:
+        return {"ok": False, "error": last_err or "no metrics endpoint reachable"}
 
     # Model name from any series that carries the label.
     model = None
@@ -431,7 +465,10 @@ def collect_vllm() -> dict[str, Any]:
         v = _histogram_quantile(parsed, hist, q)
         return round(v, nd) if v is not None else None
 
+    # vLLM: kv_cache_usage_perc; NVIDIA NIM: gpu_cache_usage_perc.
     kv = _sum_metric(parsed, "vllm:kv_cache_usage_perc")
+    if kv is None:
+        kv = _sum_metric(parsed, "gpu_cache_usage_perc")
 
     # Prefix-cache hit rate (only meaningful when prefix caching is enabled).
     pc_hits = _sum_metric(parsed, "vllm:prefix_cache_hits_total")
@@ -487,18 +524,29 @@ def collect_vllm_config() -> dict[str, Any]:
         return {"ok": False, "error": "docker SDK not available"}
     try:
         client = get_docker_client()
+        # Known inference-server markers (vLLM, NVIDIA NIM, TensorRT-LLM, TGI, SGLang).
+        patterns = ("vllm", "nim", "nvcr.io/nim", "tensorrt", "trt-llm", "tgi", "sglang")
+
+        def looks_like_server(c) -> bool:
+            if "monitor" in c.name.lower():
+                return False  # never match our own agent
+            img = (c.image.tags[0] if c.image.tags else "").lower()
+            return any(p in img or p in c.name.lower() for p in patterns)
+
+        all_containers = client.containers.list(all=True)
         container = None
-        try:
-            container = client.containers.get(VLLM_CONTAINER)
-        except Exception:  # noqa: BLE001
-            # Fall back to any container whose image/name mentions vllm.
-            for c in client.containers.list(all=True):
-                img = c.image.tags[0] if c.image.tags else ""
-                if "vllm" in img.lower() or "vllm" in c.name.lower():
-                    container = c
-                    break
+        # Prefer a *running* server (so a stopped vllm doesn't shadow a live nim).
+        running = [c for c in all_containers if c.status == "running" and looks_like_server(c)]
+        if running:
+            container = running[0]
+        else:
+            try:
+                container = client.containers.get(VLLM_CONTAINER)
+            except Exception:  # noqa: BLE001
+                matches = [c for c in all_containers if looks_like_server(c)]
+                container = matches[0] if matches else None
         if container is None:
-            return {"ok": False, "error": f"container '{VLLM_CONTAINER}' not found"}
+            return {"ok": False, "error": f"no inference container found (looked for {VLLM_CONTAINER} / nim / vllm / …)"}
 
         attrs = container.attrs
         cfg = attrs.get("Config", {})
@@ -547,8 +595,26 @@ def collect_vllm_config() -> dict[str, Any]:
             src = m.get("Name") or m.get("Source")
             mounts.append({"source": src, "dest": m.get("Destination"), "type": m.get("Type")})
 
+        # Identify the serving engine from the container image/name so the UI
+        # can label itself (NIM vs vLLM vs …) without a manual switch.
+        img_l = (cfg.get("Image") or "").lower()
+        name_l = container.name.lower()
+        if "nvcr.io/nim" in img_l or "nim" in name_l:
+            engine = "NIM"
+        elif "vllm" in img_l or "vllm" in name_l:
+            engine = "vLLM"
+        elif "tensorrt" in img_l or "trt-llm" in img_l or "triton" in img_l:
+            engine = "TensorRT-LLM"
+        elif "text-generation-inference" in img_l or "/tgi" in img_l:
+            engine = "TGI"
+        elif "sglang" in img_l:
+            engine = "SGLang"
+        else:
+            engine = "LLM"
+
         return {
             "ok": True,
+            "engine": engine,
             "container": container.name,
             "image": cfg.get("Image"),
             "runtime": host.get("Runtime"),
