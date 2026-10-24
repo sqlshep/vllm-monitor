@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>vLLM Monitor</title>
+  <style>
+    :root {
+      --bg: #0d1117; --panel: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e;
+      --green: #3fb950; --yellow: #d29922; --red: #f85149; --blue: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header {
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+      padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+    }
+    header h1 { font-size: 18px; margin: 0; }
+    .spacer { flex: 1; }
+    .meta { color: var(--muted); font-size: 12px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+      border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .ok { color: var(--green); } .ok .dot { background: var(--green); }
+    .warn { color: var(--yellow); } .warn .dot { background: var(--yellow); }
+    .bad { color: var(--red); } .bad .dot { background: var(--red); }
+    .muted { color: var(--muted); } .muted .dot { background: var(--muted); }
+    main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    section { margin-bottom: 32px; }
+    section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .grid.compact { gap: 12px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+    .subgroup { margin-bottom: 20px; }
+    .subhead { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+               color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+    .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+    .stat .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .stat .value { font-size: 24px; font-weight: 700; line-height: 1.1; }
+    .stat .value.sm { font-size: 20px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .card h3 { margin: 0 0 4px; font-size: 15px; word-break: break-all; }
+    .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; word-break: break-all; }
+    .kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 13px; }
+    .kv span:first-child { color: var(--muted); }
+    .bar { height: 6px; border-radius: 3px; background: #21262d; overflow: hidden; margin: 6px 0 2px; }
+    .bar > div { height: 100%; background: var(--blue); }
+    .bar.hot > div { background: var(--red); } .bar.warm > div { background: var(--yellow); }
+    .daemon-stats { display: flex; gap: 20px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+    .daemon-stats b { color: var(--text); }
+    .error { background: rgba(248,81,73,.1); border: 1px solid var(--red); color: #ffb0ab;
+             padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table th, table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    table th { color: var(--muted); font-weight: 600; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+           background: #21262d; padding: 1px 6px; border-radius: 4px; color: #e6edf3; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🖥️ vLLM Monitor</h1>
+    <span id="conn" class="pill muted"><span class="dot"></span>connecting…</span>
+    <div class="spacer"></div>
+    <label class="meta">refresh
+      <select id="interval">
+        <option value="3000">3s</option>
+        <option value="5000" selected>5s</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+      </select>
+    </label>
+    <span id="updated" class="meta"></span>
+  </header>
+
+  <main>
+    <div id="error" class="error" style="display:none"></div>
+
+    <section>
+      <h2>vLLM</h2>
+      <div id="vllm-model" class="daemon-stats"></div>
+      <div id="vllm"></div>
+      <div id="vllm-empty" class="muted"></div>
+    </section>
+
+    <section>
+      <h2>GPU</h2>
+      <div id="gpu-apps-wrap" style="display:none">
+        <div id="gpu" class="grid"></div>
+        <h2 style="margin-top:24px">GPU Processes</h2>
+        <div class="card"><table id="apps"><thead><tr><th>PID</th><th>Process</th><th>Memory</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div id="gpu-empty" class="muted"></div>
+    </section>
+
+    <section>
+      <h2>Host</h2>
+      <div id="host-uptime" class="daemon-stats"></div>
+      <div id="host"></div>
+      <div id="host-empty" class="muted"></div>
+    </section>
+
+    <section>
+      <h2>Docker</h2>
+      <div id="daemon" class="daemon-stats"></div>
+      <div id="docker" class="grid"></div>
+      <div id="docker-empty" class="muted"></div>
+    </section>
+
+    <section>
+      <h2>vLLM Configuration</h2>
+      <div id="vcfg-runtime" class="daemon-stats"></div>
+      <div id="vcfg" class="grid" style="grid-template-columns: 1fr;"></div>
+      <div id="vcfg-empty" class="muted"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let timer = null;
+
+    function fmtUptime(s) {
+      if (s == null) return "—";
+      const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+      if (d) return `${d}d ${h}h`;
+      if (h) return `${h}h ${m}m`;
+      return `${m}m`;
+    }
+    function fmtBytes(b) {
+      if (b == null) return "—";
+      const gb = b / 1e9;
+      return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(b / 1e6).toFixed(0)} MB`;
+    }
+    function num(v, suffix = "") { return v == null ? "—" : `${v}${suffix}`; }
+
+    function statusClass(status, health) {
+      if (health === "unhealthy") return "bad";
+      if (health === "starting") return "warn";
+      if (status === "running") return health === "healthy" || health == null ? "ok" : "warn";
+      if (status === "restarting") return "warn";
+      return "bad"; // exited, dead, created, paused
+    }
+
+    function setConn(cls, text) {
+      const el = $("conn");
+      el.className = "pill " + cls;
+      el.innerHTML = `<span class="dot"></span>${text}`;
+    }
+
+    function stat(label, value, cls) {
+      const small = String(value).length > 7 ? " sm" : "";
+      return `<div class="stat"><div class="label">${label}</div>
+        <div class="value${small} ${cls || ''}">${value}</div></div>`;
+    }
+    function group(title, cards) {
+      return `<div class="subgroup"><div class="subhead">${title}</div>
+        <div class="grid compact">${cards.join("")}</div></div>`;
+    }
+
+    function fmtRate(b) {
+      if (b == null) return "—";
+      if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB/s";
+      if (b >= 1e3) return (b / 1e3).toFixed(0) + " KB/s";
+      return b + " B/s";
+    }
+    function barTile(label, pct, detail, cls) {
+      const p = pct == null ? 0 : pct;
+      const barCls = p >= 90 ? "hot" : p >= 70 ? "warm" : "";
+      return `<div class="stat"><div class="label">${label}</div>
+        <div class="value sm ${cls || ''}">${pct == null ? "—" : p + "%"}</div>
+        <div class="bar ${barCls}" style="margin-top:8px"><div style="width:${p}%"></div></div>
+        <div class="label" style="margin:6px 0 0">${detail || ""}</div></div>`;
+    }
+
+    function renderHost(h) {
+      const up = $("host-uptime"), root = $("host"), empty = $("host-empty");
+      if (!h || !h.ok) {
+        up.innerHTML = ""; root.innerHTML = "";
+        empty.textContent = h && h.error ? `Host: ${h.error}` : "No host data.";
+        return;
+      }
+      empty.textContent = "";
+      up.innerHTML = `<div>Uptime <b>${fmtUptime(h.uptime_seconds)}</b></div>
+        <div>Processes <b>${num(h.processes)}</b></div>
+        <div>Load <b>${h.load1 ?? "—"} · ${h.load5 ?? "—"} · ${h.load15 ?? "—"}</b></div>`;
+      const sys = [
+        barTile("CPU", h.cpu_pct, h.load1 != null ? `load ${h.load1}` : ""),
+        barTile("Memory", h.mem_used_pct, `${fmtBytes(h.mem_used)} / ${fmtBytes(h.mem_total)}`),
+        barTile("Swap", h.swap_used_pct, h.swap_total ? `${fmtBytes(h.swap_used)} / ${fmtBytes(h.swap_total)}` : "none"),
+      ];
+      const net = [
+        stat("Net Rx", fmtRate(h.net_rx_bytes_per_sec)),
+        stat("Net Tx", fmtRate(h.net_tx_bytes_per_sec)),
+      ];
+      const disk = [];
+      if (h.disk) disk.push(barTile("Disk /", h.disk.used_pct, `${fmtBytes(h.disk.free)} free of ${fmtBytes(h.disk.total)}`));
+      (h.volumes || []).forEach((v) => disk.push(stat(v.name, fmtBytes(v.size))));
+      root.innerHTML =
+        group("System", sys) +
+        group("Network", net) +
+        (disk.length ? group("Disk", disk) : "");
+    }
+
+    function renderVllm(v) {
+      const model = $("vllm-model"), root = $("vllm"), empty = $("vllm-empty");
+      if (!v || !v.ok) {
+        model.innerHTML = ""; root.innerHTML = "";
+        empty.textContent = v && v.error ? `vLLM: ${v.error}` : "No vLLM data.";
+        return;
+      }
+      empty.textContent = "";
+      const u = (x, s = "") => (x == null ? "—" : x + s);
+      model.innerHTML = `<div>Model <b>${v.model ?? "—"}</b></div>
+        <div>Finished requests <b>${v.requests_finished ?? "—"}</b></div>
+        <div>Total prompt tokens <b>${num(v.prompt_tokens_total)}</b></div>
+        <div>Total output tokens <b>${num(v.generation_tokens_total)}</b></div>`;
+      const kv = v.kv_cache_usage_pct;
+      const kvCls = kv >= 90 ? "bad" : kv >= 70 ? "warn" : "";
+      const waitCls = v.requests_waiting > 0 ? "warn" : "";
+      const preemptCls = v.preemptions_total > 0 ? "warn" : "";
+      root.innerHTML =
+        group("Load & queue", [
+          stat("Requests running", num(v.requests_running)),
+          stat("Requests waiting", num(v.requests_waiting), waitCls),
+          stat("KV cache", u(kv, "%"), kvCls),
+          stat("Preemptions", num(v.preemptions_total), preemptCls),
+        ]) +
+        group("Throughput", [
+          stat("Output", u(v.output_tokens_per_sec, " tok/s")),
+          stat("Input", u(v.input_tokens_per_sec, " tok/s")),
+        ]) +
+        group("Latency", [
+          stat("Time to first token", u(v.avg_ttft_ms, " ms")),
+          stat("Time between tokens", u(v.avg_inter_token_ms, " ms")),
+          stat("Total P50", u(v.latency_p50_s, " s")),
+          stat("Total P95", u(v.latency_p95_s, " s")),
+          stat("Total P99", u(v.latency_p99_s, " s")),
+        ]) +
+        group("Tokens & cache", [
+          stat("Avg prompt tokens/req", num(v.avg_prompt_tokens_per_req)),
+          stat("Avg output tokens/req", num(v.avg_output_tokens_per_req)),
+          stat("Prefix-cache hit rate", v.prefix_cache_hit_rate_pct == null ? "n/a" : v.prefix_cache_hit_rate_pct + "%"),
+        ]);
+    }
+
+    function renderGpu(gpu) {
+      const wrap = $("gpu-apps-wrap"), empty = $("gpu-empty"), grid = $("gpu");
+      if (!gpu || !gpu.ok) {
+        wrap.style.display = "none";
+        empty.textContent = gpu && gpu.error ? `GPU: ${gpu.error}` : "No GPU data.";
+        return;
+      }
+      wrap.style.display = "block"; empty.textContent = "";
+      grid.innerHTML = (gpu.gpus || []).map((g) => {
+        const memPct = g["memory.used_pct"] ?? 0;
+        const util = g["utilization.gpu"] ?? 0;
+        const temp = g["temperature.gpu"];
+        const tempCls = temp >= 85 ? "hot" : temp >= 70 ? "warm" : "";
+        const memCls = memPct >= 90 ? "hot" : memPct >= 70 ? "warm" : "";
+        return `<div class="card">
+          <h3>GPU ${g.index}: ${g.name}</h3>
+          <div class="sub">${g.uuid || ""}</div>
+          <div class="kv"><span>Compute</span><span>${num(util, "%")}</span></div>
+          <div class="bar"><div style="width:${util}%"></div></div>
+          <div class="kv"><span>Memory</span><span>${g["memory.used"]} / ${g["memory.total"]} MiB (${memPct}%)</span></div>
+          <div class="bar ${memCls}"><div style="width:${memPct}%"></div></div>
+          <div class="kv ${tempCls === "hot" ? "bad" : tempCls === "warm" ? "warn" : ""}"><span>Temp</span><span>${num(temp, "°C")}</span></div>
+          <div class="kv"><span>Power</span><span>${num(g["power.draw"], "W")} / ${num(g["power.limit"], "W")}</span></div>
+          <div class="kv"><span>Fan</span><span>${num(g["fan.speed"], "%")}</span></div>
+          <div class="kv"><span>Clocks</span><span>${num(g["clocks.sm"], " MHz")} sm · P-state ${g.pstate ?? "—"}</span></div>
+          <div class="kv"><span>PCIe</span><span>gen ${num(g["pcie.link.gen.current"])}/${num(g["pcie.link.gen.max"])} · x${num(g["pcie.link.width.current"])}</span></div>
+          <div class="kv"><span>Driver</span><span>${g.driver_version ?? "—"}</span></div>
+          <div class="kv ${g["ecc.errors.uncorrected.volatile.total"] ? "bad" : ""}"><span>ECC errors</span><span>${g["ecc.errors.uncorrected.volatile.total"] == null ? "n/a" : g["ecc.errors.uncorrected.volatile.total"]}</span></div>
+          <div class="kv"><span>Throttling</span><span class="${g.throttled ? "bad" : ""}">${g.throttling == null ? "—" : (g.throttled ? g.throttling.join(", ") : "none")}</span></div>
+        </div>`;
+      }).join("");
+
+      const tbody = $("apps").querySelector("tbody");
+      const apps = gpu.compute_apps || [];
+      tbody.innerHTML = apps.length
+        ? apps.map((a) => `<tr><td>${a.pid}</td><td>${a.process_name}</td><td>${num(a.used_memory_mib, " MiB")}</td></tr>`).join("")
+        : `<tr><td colspan="3" class="muted">No active GPU processes.</td></tr>`;
+    }
+
+    function renderDocker(d) {
+      const daemon = $("daemon"), grid = $("docker"), empty = $("docker-empty");
+      if (!d || !d.ok) {
+        daemon.innerHTML = ""; grid.innerHTML = "";
+        empty.textContent = d && d.error ? `Docker: ${d.error}` : "No Docker data.";
+        return;
+      }
+      empty.textContent = "";
+      const info = d.daemon || {};
+      daemon.innerHTML = `
+        <div>Running <b>${info.containers_running ?? "—"}</b> / ${info.containers_total ?? "—"}</div>
+        <div>Images <b>${info.images ?? "—"}</b></div>
+        <div>CPUs <b>${info.ncpu ?? "—"}</b></div>
+        <div>RAM <b>${fmtBytes(info.mem_total)}</b></div>
+        <div>Docker <b>${info.server_version ?? "—"}</b></div>`;
+      grid.innerHTML = (d.containers || []).map((c) => {
+        const cls = statusClass(c.status, c.health);
+        const health = c.health ? ` · ${c.health}` : "";
+        return `<div class="card">
+          <h3>${c.name}</h3>
+          <div class="sub">${c.image}</div>
+          <div class="kv"><span>Status</span><span class="pill ${cls}"><span class="dot"></span>${c.status}${health}</span></div>
+          <div class="kv"><span>Uptime</span><span>${fmtUptime(c.uptime_seconds)}</span></div>
+          <div class="kv"><span>Restarts</span><span>${c.restart_count}</span></div>
+          ${c.stats ? `<div class="kv"><span>CPU</span><span>${num(c.stats.cpu_pct, "%")}</span></div>
+          <div class="kv"><span>Memory</span><span>${fmtBytes(c.stats.mem_used)}${c.stats.mem_pct != null ? ` (${c.stats.mem_pct}%)` : ""}</span></div>` : ""}
+          ${c.status !== "running" && c.exit_code != null ? `<div class="kv bad"><span>Exit code</span><span>${c.exit_code}</span></div>` : ""}
+        </div>`;
+      }).join("");
+    }
+
+    function fmtGiB(b) {
+      if (b == null || !b) return "—";
+      const gib = b / 1073741824;
+      return (Number.isInteger(gib) ? gib : gib.toFixed(1)) + " GiB";
+    }
+
+    function renderVllmConfig(c) {
+      const rt = $("vcfg-runtime"), box = $("vcfg"), empty = $("vcfg-empty");
+      if (!c || !c.ok) {
+        rt.innerHTML = ""; box.innerHTML = "";
+        empty.textContent = c && c.error ? `Config: ${c.error}` : "No config data.";
+        return;
+      }
+      empty.textContent = "";
+      rt.innerHTML = `
+        <div>Container <b>${c.container}</b></div>
+        <div>Image <b>${c.image ?? "—"}</b></div>
+        <div>Runtime <b>${c.runtime ?? "—"}</b></div>
+        <div>GPUs <b>${c.gpus ?? "—"}</b></div>
+        <div>Shm <b>${fmtGiB(c.shm_size_bytes)}</b></div>
+        <div>Restart <b>${c.restart_policy || "—"}</b></div>`;
+      const ports = (c.ports || []).map((p) => `<code>${p}</code>`).join("<br>") || "—";
+      const mounts = (c.mounts || []).map((m) => `<code>${m.source} → ${m.dest}</code> <span class="muted">(${m.type})</span>`).join("<br>") || "—";
+      const args = c.engine_args || {};
+      const rows = Object.keys(args).map((k) => {
+        const v = args[k];
+        const val = v === true
+          ? '<span class="pill ok"><span class="dot"></span>enabled</span>'
+          : `<code>${v}</code>`;
+        return `<tr><td><code>--${k}</code></td><td>${val}</td></tr>`;
+      }).join("");
+      box.innerHTML = `<div class="card">
+        <div class="kv"><span>Ports</span><span style="text-align:right">${ports}</span></div>
+        <div class="kv"><span>Volumes</span><span style="text-align:right">${mounts}</span></div>
+        <h3 style="margin:14px 0 6px;font-size:13px">Engine arguments</h3>
+        <table>${rows || '<tr><td class="muted">none</td></tr>'}</table>
+      </div>`;
+    }
+
+    async function poll() {
+      try {
+        const r = await fetch("/api/status", { cache: "no-store" });
+        const data = await r.json();
+        if (!data.ok) {
+          setConn("bad", "error");
+          $("error").style.display = "block";
+          $("error").textContent = data.error || "Unknown error.";
+          return;
+        }
+        $("error").style.display = "none";
+        setConn("ok", "live");
+        $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+        renderVllm(data.vllm);
+        renderGpu(data.gpu);
+        renderHost(data.host);
+        renderDocker(data.docker);
+        renderVllmConfig(data.vllm_config);
+      } catch (e) {
+        setConn("bad", "offline");
+        $("error").style.display = "block";
+        $("error").textContent = "Cannot reach the dashboard server: " + e.message;
+      }
+    }
+
+    function restart() {
+      if (timer) clearInterval(timer);
+      poll();
+      timer = setInterval(poll, parseInt($("interval").value, 10));
+    }
+    $("interval").addEventListener("change", restart);
+    restart();
+  </script>
+</body>
+</html>

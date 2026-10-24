@@ -1,0 +1,42 @@
+# Deploy THIS on the GCP instance (the one running vLLM).
+#
+#   export AGENT_TOKEN="$(openssl rand -hex 32)"   # save this; the dashboard needs it
+#   docker compose -f docker-compose.agent.yml up -d --build
+#
+# Then open the agent port (default 9100) in the GCP firewall, ideally scoped
+# to your dashboard's source IP only. See README.md.
+
+services:
+  monitor-agent:
+    build: ./agent
+    container_name: vllm-monitor-agent
+    restart: unless-stopped
+    # Host networking so the agent can scrape vLLM's metrics on localhost:8000
+    # (vLLM binds to 127.0.0.1, unreachable from a bridge network). This also
+    # publishes the agent directly on host port 9100 (no ports mapping needed).
+    network_mode: host
+    # Share the host PID namespace so nvidia-smi can resolve the names/PIDs of
+    # GPU compute processes (e.g. vLLM) running on the host. Without this the
+    # "GPU Processes" list is blank even though GPU memory is in use.
+    pid: "host"
+    environment:
+      # Required. Shared secret the dashboard sends as a bearer token.
+      - AGENT_TOKEN=${AGENT_TOKEN:?set AGENT_TOKEN in your shell or a .env file}
+      # Where to scrape vLLM's Prometheus metrics (OpenAI server /metrics).
+      - VLLM_METRICS_URL=${VLLM_METRICS_URL:-http://localhost:8000/metrics}
+      # Only need 'utility' capability for nvidia-smi queries.
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=utility
+    volumes:
+      # Read-only: the agent only inspects, never controls, containers.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read-only host root so the agent can report host disk usage (df).
+      - /:/host:ro
+    # GPU access so nvidia-smi is available inside the container.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [utility]
