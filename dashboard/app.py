@@ -58,6 +58,33 @@ async def api_status() -> JSONResponse:
         )
 
 
+@app.post("/api/analyze")
+async def api_analyze() -> JSONResponse:
+    if not AGENT_URL or not AGENT_TOKEN:
+        return JSONResponse(
+            {"ok": False, "error": "AGENT_URL / AGENT_TOKEN not configured on the dashboard."},
+            status_code=500,
+        )
+    headers = {"Authorization": f"Bearer {AGENT_TOKEN}"}
+    try:
+        # Generation can take a while on a busy / cold model.
+        async with httpx.AsyncClient(timeout=180) as client:
+            resp = await client.post(f"{AGENT_URL}/api/analyze", headers=headers)
+        if resp.status_code == 401:
+            return JSONResponse(
+                {"ok": False, "error": "Agent rejected the token (401)."}, status_code=502
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        data["ok"] = True
+        return JSONResponse(data)
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"Could not reach agent at {AGENT_URL}: {exc}"},
+            status_code=502,
+        )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "index.html").read_text())

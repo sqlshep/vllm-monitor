@@ -32,6 +32,7 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 - **GPU** — utilization, memory, temperature, power, clocks, PCIe, throttle reasons, ECC, per-process usage
 - **Host** — CPU, load, RAM/swap, disk, network, uptime
 - **Docker** — container health/status plus per-container CPU/memory
+- **✨ AI analysis** — one click sends the live snapshot to the monitored model itself and returns a plain-English health assessment
 
 ![LLM Server Monitor dashboard](docs/dashboard.png?v=3)
 
@@ -138,6 +139,7 @@ NvidiaPrep/
 | `GET /api/vllm` | Bearer | Serving metrics — vLLM or NIM (throughput, latency percentiles, KV/prefix cache, …) |
 | `GET /api/vllm-config` | Bearer | Serving container launch config (engine args + runtime flags; engine auto-detected) |
 | `GET /api/all` | Bearer | Combined snapshot — what the dashboard consumes |
+| `POST /api/analyze` | Bearer | Sends the live snapshot to the monitored engine (`/v1/chat/completions`) and returns its analysis |
 
 ### Metrics reference
 

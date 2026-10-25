@@ -12,6 +12,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shutil
@@ -757,6 +758,82 @@ def collect_host() -> dict[str, Any]:
     return out
 
 
+# --------------------------------------------------------------------------
+# AI self-analysis: feed the live snapshot to the very model we're monitoring
+# (reachable locally on the host) and return its plain-English assessment.
+# --------------------------------------------------------------------------
+
+def _openai_base() -> str:
+    """Derive the OpenAI-compatible base URL (…/v1) from the metrics URL."""
+    u = VLLM_METRICS_URL
+    for suffix in ("/v1/metrics", "/metrics"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)]
+            break
+    return u.rstrip("/") + "/v1"
+
+
+def _discover_model(base: str) -> str | None:
+    """Ask the engine which model id to use (works for vLLM and NIM)."""
+    try:
+        req = urllib.request.Request(base + "/models", headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    items = data.get("data") or []
+    return items[0].get("id") if items else None
+
+
+ANALYZE_SYSTEM = (
+    "You are a senior site-reliability engineer analyzing live telemetry from an "
+    "LLM inference server (vLLM or NVIDIA NIM) running on a single GPU host. You "
+    "are given a JSON snapshot covering serving metrics, GPU, host, Docker "
+    "containers, and the launch configuration. Produce a concise health "
+    "assessment with short markdown sections:\n"
+    "1. Overall status — one line (healthy / degraded / idle / at risk).\n"
+    "2. Findings — grouped bullets for serving, GPU, host, and containers.\n"
+    "3. Risks & bottlenecks — saturation, KV-cache pressure, GPU throttling, "
+    "disk, memory, request failures.\n"
+    "4. Recommendations — concrete, actionable next steps.\n"
+    "Cite the actual numbers from the snapshot. If something is idle or healthy, "
+    "say so briefly. Do NOT invent metrics that are not present."
+)
+
+
+def analyze_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    base = _openai_base()
+    model = _discover_model(base)
+    if not model:
+        return {"ok": False, "error": f"No model available at {base}/models — is the engine serving?"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": ANALYZE_SYSTEM},
+            {"role": "user", "content": "Current dashboard snapshot (JSON):\n\n```json\n"
+                + json.dumps(snapshot, indent=2) + "\n```\n\nAnalyze it."},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 800,
+        "stream": False,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/chat/completions", data=body, method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"Chat completion failed: {exc}"}
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": "Unexpected response shape from engine."}
+    return {"ok": True, "model": model, "analysis": text, "usage": data.get("usage") or {}}
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
     return {"ok": True, "time": _now_iso()}
@@ -797,3 +874,16 @@ def api_all() -> dict[str, Any]:
         "vllm": collect_vllm(),
         "vllm_config": collect_vllm_config(),
     }
+
+
+@app.post("/api/analyze", dependencies=[Depends(require_token)])
+def api_analyze() -> dict[str, Any]:
+    """Send the live snapshot to the monitored engine and return its analysis."""
+    snapshot = {
+        "host": collect_host(),
+        "gpu": collect_gpu(),
+        "vllm": collect_vllm(),
+        "vllm_config": collect_vllm_config(),
+        "docker": collect_docker(),
+    }
+    return {"time": _now_iso(), "analysis": analyze_snapshot(snapshot)}

@@ -65,6 +65,21 @@
     .chart-legend { font-weight: 400; text-transform: none; letter-spacing: 0; }
     .chart-legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
                         margin: 0 4px 0 12px; vertical-align: middle; }
+    .btn { background: #238636; color: #fff; border: 1px solid rgba(240,246,252,.1);
+           border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .btn:hover { background: #2ea043; }
+    .btn:disabled { opacity: .6; cursor: default; }
+    .btn-sm { padding: 2px 8px; background: transparent; color: var(--muted); border-color: var(--border); }
+    .btn-sm:hover { background: #21262d; color: var(--text); }
+    .analysis { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+                padding: 16px 18px; margin-bottom: 24px; }
+    .analysis-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .analysis-body h4 { margin: 14px 0 4px; font-size: 14px; color: var(--text); }
+    .analysis-body p { margin: 6px 0; }
+    .analysis-body ul { margin: 6px 0 10px; padding-left: 20px; }
+    .analysis-body li { margin: 2px 0; }
+    .analysis-body code { font-size: 12px; }
+    .analysis-body .bad { color: var(--red); }
   </style>
 </head>
 <body>
@@ -72,6 +87,7 @@
     <h1>🖥️ LLM Server Monitor</h1>
     <span id="conn" class="pill muted"><span class="dot"></span>connecting…</span>
     <div class="spacer"></div>
+    <button id="analyze-btn" class="btn" title="Ask the monitored model to analyze the live snapshot">✨ Analyze</button>
     <label class="meta">refresh
       <select id="interval">
         <option value="3000">3s</option>
@@ -85,6 +101,16 @@
 
   <main>
     <div id="error" class="error" style="display:none"></div>
+
+    <div id="analysis" class="analysis" style="display:none">
+      <div class="analysis-head">
+        <strong>✨ AI analysis</strong>
+        <span id="analysis-meta" class="meta"></span>
+        <div class="spacer"></div>
+        <button id="analysis-close" class="btn btn-sm" title="Close">✕</button>
+      </div>
+      <div id="analysis-body" class="analysis-body"></div>
+    </div>
 
     <section>
       <h2 id="vllm-title">vLLM</h2>
@@ -578,6 +604,65 @@
       poll();
       timer = setInterval(poll, parseInt($("interval").value, 10));
     }
+    // ---- AI analysis (minimal, safe markdown rendering) ----
+    function esc(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+    function inlineMd(s) {
+      return esc(s)
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    }
+    function mdToHtml(md) {
+      const lines = (md || "").split(/\r?\n/);
+      let html = "", inUl = false;
+      const closeUl = () => { if (inUl) { html += "</ul>"; inUl = false; } };
+      for (const raw of lines) {
+        const line = raw.trimEnd();
+        if (!line.trim()) { closeUl(); continue; }
+        let m;
+        if ((m = line.match(/^#{1,6}\s+(.*)$/))) { closeUl(); html += `<h4>${inlineMd(m[1])}</h4>`; continue; }
+        if ((m = line.match(/^\s*[-*]\s+(.*)$/)) || (m = line.match(/^\s*\d+\.\s+(.*)$/))) {
+          if (!inUl) { html += "<ul>"; inUl = true; }
+          html += `<li>${inlineMd(m[1])}</li>`; continue;
+        }
+        closeUl();
+        html += `<p>${inlineMd(line)}</p>`;
+      }
+      closeUl();
+      return html;
+    }
+
+    async function analyze() {
+      const btn = $("analyze-btn"), panel = $("analysis"),
+            body = $("analysis-body"), meta = $("analysis-meta");
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "✨ Analyzing…";
+      panel.style.display = "block";
+      meta.textContent = "";
+      body.innerHTML = '<p class="muted">Asking the monitored model to analyze the current snapshot… this can take up to a minute.</p>';
+      try {
+        const r = await fetch("/api/analyze", { method: "POST" });
+        const data = await r.json();
+        const a = (data && data.analysis) || {};
+        if (!data.ok || !a.ok) {
+          body.innerHTML = `<p class="bad">${esc(a.error || data.error || "Analysis failed.")}</p>`;
+        } else {
+          body.innerHTML = mdToHtml(a.analysis);
+          const tok = a.usage && a.usage.total_tokens ? ` · ${a.usage.total_tokens} tokens` : "";
+          meta.textContent = `model: ${a.model || "?"}${tok} · ${new Date().toLocaleTimeString()}`;
+        }
+      } catch (e) {
+        body.innerHTML = `<p class="bad">Request failed: ${esc(e.message)}</p>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    }
+    $("analyze-btn").addEventListener("click", analyze);
+    $("analysis-close").addEventListener("click", () => { $("analysis").style.display = "none"; });
+
     $("interval").addEventListener("change", restart);
     let resizeTimer = null;
     window.addEventListener("resize", () => {
