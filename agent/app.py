@@ -152,6 +152,7 @@ def collect_docker() -> dict[str, Any]:
                 "uptime_seconds": uptime_s,
                 "restart_count": attrs.get("RestartCount", 0),
                 "exit_code": state.get("ExitCode"),
+                "oom_killed": state.get("OOMKilled", False),
                 "ports": attrs.get("NetworkSettings", {}).get("Ports", {}),
             }
             if state.get("Running"):
@@ -222,6 +223,12 @@ def _to_num(value: str) -> float | int | str | None:
         return int(value)
     except ValueError:
         return value
+
+
+# Cumulative GPU energy (Wh), integrated from power.draw between scrapes.
+# Keyed by GPU uuid so it survives index reshuffles; resets on agent restart.
+_gpu_energy: dict[str, float] = {}
+_gpu_energy_t: dict[str, float] = {"t": 0.0}
 
 
 def collect_gpu() -> dict[str, Any]:
@@ -300,6 +307,23 @@ def collect_gpu() -> dict[str, Any]:
         except subprocess.SubprocessError:
             pass  # compute-apps can fail on some setups; GPU stats still useful
 
+        # Integrate power draw into cumulative energy (Wh) per GPU.
+        try:
+            tnow = time.monotonic()
+            tprev = _gpu_energy_t.get("t") or 0.0
+            dt = tnow - tprev if tprev else 0.0
+            _gpu_energy_t["t"] = tnow
+            for row in gpus:
+                uuid = row.get("uuid")
+                pw = row.get("power.draw")
+                if uuid and isinstance(pw, (int, float)):
+                    if 0 < dt < 3600:  # ignore first sample / long gaps
+                        _gpu_energy[uuid] = _gpu_energy.get(uuid, 0.0) + pw * dt / 3600.0
+                    row["energy_wh"] = round(_gpu_energy.get(uuid, 0.0), 2)
+                    row["energy_kwh"] = round(_gpu_energy.get(uuid, 0.0) / 1000.0, 4)
+        except Exception:  # noqa: BLE001
+            pass
+
         return {"ok": True, "gpus": gpus, "compute_apps": apps}
     except subprocess.CalledProcessError as exc:
         return {"ok": False, "error": f"nvidia-smi failed: {exc.stderr.strip()}"}
@@ -352,6 +376,21 @@ def _sum_metric(parsed: dict, name: str) -> float | None:
     if not series:
         return None
     return sum(v for _, v in series)
+
+
+def _sum_by_label(parsed: dict, name: str, label_key: str) -> dict[str, float]:
+    """Sum a counter grouped by one label value (e.g. finished_reason)."""
+    series = _resolve(parsed, name)
+    if not series:
+        return {}
+    token = f'{label_key}="'
+    out: dict[str, float] = {}
+    for labels, val in series:
+        if token not in labels:
+            continue
+        key = labels.split(token, 1)[1].split('"', 1)[0]
+        out[key] = out.get(key, 0.0) + val
+    return out
 
 
 def _histogram_quantile(parsed: dict, name: str, q: float) -> float | None:
@@ -471,13 +510,29 @@ def collect_vllm() -> dict[str, Any]:
     if kv is None:
         kv = _sum_metric(parsed, "gpu_cache_usage_perc")
 
-    # Prefix-cache hit rate (only meaningful when prefix caching is enabled).
+    # Prefix-cache hit rate (vLLM only; NIM doesn't publish these counters).
+    # Newer vLLM renamed them with a gpu_ prefix, so try both.
     pc_hits = _sum_metric(parsed, "vllm:prefix_cache_hits_total")
+    if pc_hits is None:
+        pc_hits = _sum_metric(parsed, "vllm:gpu_prefix_cache_hits_total")
     pc_queries = _sum_metric(parsed, "vllm:prefix_cache_queries_total")
+    if pc_queries is None:
+        pc_queries = _sum_metric(parsed, "vllm:gpu_prefix_cache_queries_total")
     prefix_hit_rate = (
         round(pc_hits / pc_queries * 100, 1)
         if pc_hits is not None and pc_queries else None
     )
+
+    # Finish-reason breakdown: vLLM labels request_success_total by
+    # finished_reason; NIM uses request_finish_total. A high "length" share
+    # means responses are being truncated at max_tokens.
+    finish = _sum_by_label(parsed, "vllm:request_success_total", "finished_reason")
+    if not finish:
+        finish = _sum_by_label(parsed, "request_finish_total", "finished_reason")
+    finish_reasons = {k: int(v) for k, v in finish.items()} or None
+
+    # CPU-offload KV cache (only meaningful when vLLM swap space is enabled).
+    cpu_kv = _sum_metric(parsed, "vllm:cpu_cache_usage_perc")
 
     e2e = "vllm:e2e_request_latency_seconds"
     return {
@@ -493,16 +548,30 @@ def collect_vllm() -> dict[str, Any]:
         # Latency.
         "avg_ttft_ms": avg("vllm:time_to_first_token_seconds_sum",
                            "vllm:time_to_first_token_seconds_count", scale=1000),
-        "avg_inter_token_ms": avg("vllm:inter_token_latency_seconds_sum",
-                                  "vllm:inter_token_latency_seconds_count", scale=1000),
+        # Inter-token latency: vLLM calls it inter_token_latency_seconds;
+        # NIM (and older vLLM) expose it as time_per_output_token_seconds.
+        "avg_inter_token_ms": (
+            avg("vllm:inter_token_latency_seconds_sum",
+                "vllm:inter_token_latency_seconds_count", scale=1000)
+            or avg("vllm:time_per_output_token_seconds_sum",
+                   "vllm:time_per_output_token_seconds_count", scale=1000)
+        ),
         "latency_p50_s": pct(e2e, 0.50),
         "latency_p95_s": pct(e2e, 0.95),
         "latency_p99_s": pct(e2e, 0.99),
         "ttft_p95_ms": (lambda v: round(v * 1000, 1) if v is not None else None)(
             _histogram_quantile(parsed, "vllm:time_to_first_token_seconds", 0.95)),
+        # Latency breakdown (vLLM-only histograms; null on NIM -> UI hides them).
+        "avg_queue_time_ms": avg("vllm:request_queue_time_seconds_sum",
+                                 "vllm:request_queue_time_seconds_count", scale=1000),
+        "avg_prefill_time_ms": avg("vllm:request_prefill_time_seconds_sum",
+                                   "vllm:request_prefill_time_seconds_count", scale=1000),
+        "avg_decode_time_s": avg("vllm:request_decode_time_seconds_sum",
+                                 "vllm:request_decode_time_seconds_count", nd=3),
         # Cache pressure.
         "preemptions_total": _sum_metric(parsed, "vllm:num_preemptions_total"),
         "prefix_cache_hit_rate_pct": prefix_hit_rate,
+        "cpu_cache_usage_pct": round(cpu_kv * 100, 1) if cpu_kv is not None else None,
         # Token counts.
         "prompt_tokens_total": prompt_total,
         "generation_tokens_total": gen_total,
@@ -511,6 +580,7 @@ def collect_vllm() -> dict[str, Any]:
         "avg_output_tokens_per_req": avg("vllm:request_generation_tokens_sum",
                                          "vllm:request_generation_tokens_count", nd=0),
         "requests_finished": _sum_metric(parsed, "vllm:request_success_total"),
+        "finish_reasons": finish_reasons,
         # NIM-specific (absent on vLLM; left null there so the UI hides them):
         #   num_request_max   -> configured max concurrent requests (capacity)
         #   request_failure_total -> explicit failed-request counter
@@ -682,6 +752,7 @@ def collect_host() -> dict[str, Any]:
         total, avail = mem.get("MemTotal"), mem.get("MemAvailable")
         out["mem_total"] = total
         if total and avail is not None:
+            out["mem_available"] = avail
             out["mem_used"] = total - avail
             out["mem_used_pct"] = round((total - avail) / total * 100, 1)
         st, sf = mem.get("SwapTotal"), mem.get("SwapFree")
@@ -702,9 +773,11 @@ def collect_host() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
 
-    # Network throughput (sum of non-loopback interfaces).
+    # Network throughput + error/drop counters (sum of non-loopback interfaces).
+    # /proc/net/dev columns: rx = bytes packets errs drop ...; tx starts at idx 8.
     try:
         rx = tx = 0
+        rx_err = rx_drop = tx_err = tx_drop = 0
         for line in _read_file("/proc/net/dev").splitlines():
             if ":" not in line:
                 continue
@@ -712,9 +785,11 @@ def collect_host() -> dict[str, Any]:
             if iface.strip() == "lo":
                 continue
             f = data.split()
-            rx += int(f[0])
-            tx += int(f[8])
+            rx += int(f[0]); rx_err += int(f[2]); rx_drop += int(f[3])
+            tx += int(f[8]); tx_err += int(f[10]); tx_drop += int(f[11])
         out["net_rx_bytes"], out["net_tx_bytes"] = rx, tx
+        out["net_rx_errors"], out["net_tx_errors"] = rx_err, tx_err
+        out["net_rx_dropped"], out["net_tx_dropped"] = rx_drop, tx_drop
         prev = _host_prev.get("net")
         if prev:
             dt = now - prev[2]
@@ -722,6 +797,31 @@ def collect_host() -> dict[str, Any]:
                 out["net_rx_bytes_per_sec"] = round(max(0.0, (rx - prev[0]) / dt))
                 out["net_tx_bytes_per_sec"] = round(max(0.0, (tx - prev[1]) / dt))
         _host_prev["net"] = (rx, tx, now)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Disk I/O throughput (delta of /proc/diskstats between scrapes).
+    # Fields: ... 3=reads 6=sectors_read ... 10=writes ... Sector = 512 bytes.
+    # Sum over whole-disk devices only (skip partitions / loop / ram).
+    try:
+        rd_sect = wr_sect = 0
+        for line in _read_file("/proc/diskstats").splitlines():
+            f = line.split()
+            if len(f) < 10:
+                continue
+            dev = f[2]
+            if dev.startswith(("loop", "ram", "dm-")) or dev[-1:].isdigit():
+                continue
+            rd_sect += int(f[5])
+            wr_sect += int(f[9])
+        rd_bytes, wr_bytes = rd_sect * 512, wr_sect * 512
+        prev = _host_prev.get("diskio")
+        if prev:
+            dt = now - prev[2]
+            if dt > 0:
+                out["disk_read_bytes_per_sec"] = round(max(0.0, (rd_bytes - prev[0]) / dt))
+                out["disk_write_bytes_per_sec"] = round(max(0.0, (wr_bytes - prev[1]) / dt))
+        _host_prev["diskio"] = (rd_bytes, wr_bytes, now)
     except Exception:  # noqa: BLE001
         pass
 

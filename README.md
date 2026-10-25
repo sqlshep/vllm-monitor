@@ -34,7 +34,7 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 - **Docker** — container health/status plus per-container CPU/memory
 - **✨ AI analysis** — one click sends the live snapshot to the monitored model itself and returns a plain-English health assessment
 
-![LLM Server Monitor dashboard](docs/dashboard.png?v=3)
+![LLM Server Monitor dashboard](docs/dashboard.png?v=4)
 
 ---
 
@@ -143,21 +143,25 @@ NvidiaPrep/
 
 ### Metrics reference
 
-**Serving (vLLM / NIM)** — requests running/waiting, KV-cache %, input/output
-tokens/sec, avg TTFT, inter-token latency, total latency P50/P95/P99, preemptions,
-prefix-cache hit rate, avg prompt/output tokens per request, lifetime token totals,
-finished requests, plus NIM-only max-concurrent capacity and failed-request count.
-The serving engine is auto-detected and the dashboard labels itself accordingly.
+**Serving (vLLM / NIM)** — requests running/waiting, KV-cache % (+ CPU-offload
+KV % when enabled), input/output tokens/sec, avg TTFT, inter-token latency, total
+latency P50/P95/P99, vLLM-only latency breakdown (queue / prefill / decode),
+preemptions, prefix-cache hit rate, avg prompt/output tokens per request, lifetime
+token totals, finished requests with finish-reason breakdown (stop vs truncated),
+plus NIM-only max-concurrent capacity and failed-request count. The serving engine
+is auto-detected and the dashboard labels itself accordingly.
 
-**GPU** — utilization, memory used/total/%, temperature, power draw/limit, fan,
-SM/mem clocks, P-state, PCIe gen/width, driver version, uncorrected ECC errors,
-active throttle reasons, and per-process GPU memory.
+**GPU** — compute & memory-controller utilization, memory used/total/%, temperature,
+power draw/limit, cumulative energy (Wh/kWh), fan, SM/mem clocks, P-state, PCIe
+gen/width, driver version, uncorrected ECC errors, active throttle reasons, and
+per-process GPU memory.
 
-**Host** — CPU %, load (1/5/15m), RAM used/total/%, swap, root-disk used/free/%,
-Docker volume sizes, network Rx/Tx throughput, uptime, process count.
+**Host** — CPU %, load (1/5/15m), RAM used/total/% (+ MemAvailable), swap,
+root-disk used/free/%, disk read/write throughput, Docker volume sizes, network
+Rx/Tx throughput, NIC errors/drops, uptime, process count.
 
 **Docker** — per container: status, health, uptime, restart count, exit code,
-CPU %, memory used/%, plus daemon summary.
+OOM-killed flag, CPU %, memory used/%, plus daemon summary.
 
 ---
 

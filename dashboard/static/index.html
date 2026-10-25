@@ -139,7 +139,7 @@
       <h2>GPU</h2>
       <div id="gpu-apps-wrap" style="display:none">
         <div id="gpu" class="grid"></div>
-        <h2 style="margin-top:24px">GPU Processes</h2>
+        <h2 style="margin-top:24px" title="Processes with memory allocated on the GPU (from nvidia-smi).">GPU Processes</h2>
         <div class="card"><table id="apps"><thead><tr><th>PID</th><th>Process</th><th>Memory</th></tr></thead><tbody></tbody></table></div>
       </div>
       <div id="gpu-empty" class="muted"></div>
@@ -171,6 +171,94 @@
     const $ = (id) => document.getElementById(id);
     let timer = null;
 
+    // Metric definitions shown as hover tooltips. Plain keys are looked up by
+    // the tile label (serving + host, which have no collisions); namespaced
+    // keys (gpu./docker./cfg./srv.) disambiguate the hand-written card rows.
+    const DEFS = {
+      // Serving
+      "Requests running": "Requests being processed on the GPU right now.",
+      "Requests waiting": "Requests queued for a scheduler slot. A growing queue means the server is saturated.",
+      "Max concurrent": "Configured max concurrent requests the engine will run (NIM). The % is current running ÷ this capacity.",
+      "KV cache": "Share of the GPU KV-cache (attention key/value memory) in use. Near 100% forces preemptions.",
+      "CPU KV cache": "Share of CPU-offload KV cache in use (only when vLLM swap space is enabled).",
+      "Preemptions": "Cumulative requests the scheduler paused and recomputed due to KV-cache pressure.",
+      "Failed requests": "Cumulative requests that errored (NIM).",
+      "Output": "Output (generated) token throughput in tokens/sec, measured between refreshes.",
+      "Input": "Input (prompt) token throughput in tokens/sec, measured between refreshes.",
+      "Time to first token": "Average time from request arrival to the first generated token (TTFT).",
+      "Time between tokens": "Average inter-token latency — time between consecutive generated tokens.",
+      "Total P50": "Median (50th percentile) end-to-end request latency, estimated from histogram buckets.",
+      "Total P95": "95th-percentile end-to-end request latency, estimated from histogram buckets.",
+      "Total P99": "99th-percentile end-to-end request latency, estimated from histogram buckets.",
+      "Queue": "Average time requests spend waiting in the scheduler queue (vLLM).",
+      "Prefill": "Average time spent in the prefill phase processing the prompt (vLLM).",
+      "Decode": "Average time spent in the decode phase generating tokens (vLLM).",
+      "Avg prompt tokens/req": "Average number of prompt (input) tokens per request.",
+      "Avg output tokens/req": "Average number of generated (output) tokens per request.",
+      "Prefix-cache hit rate": "Share of prompt tokens served from the prefix cache (higher = more reuse).",
+      "Finish reasons": "Why requests ended: stop = natural end; length = truncated at max_tokens; abort = cancelled.",
+      // Host
+      "CPU": "Host CPU utilization across all cores (from /proc/stat).",
+      "Memory": "Host RAM in use vs total; 'avail' is MemAvailable (free + reclaimable).",
+      "Swap": "Host swap space in use.",
+      "Disk /": "Root filesystem usage on the instance.",
+      "Net Rx": "Inbound network throughput across non-loopback interfaces.",
+      "Net Tx": "Outbound network throughput across non-loopback interfaces.",
+      "Errors": "Cumulative NIC error count (rx+tx). Non-zero suggests a hardware/driver issue.",
+      "Dropped": "Cumulative dropped-packet count (rx+tx). Non-zero suggests buffer/overrun pressure.",
+      "Disk read": "Disk read throughput across physical devices (from /proc/diskstats).",
+      "Disk write": "Disk write throughput across physical devices.",
+      // GPU card rows
+      "gpu.compute": "GPU compute (SM) utilization — share of time the GPU was executing kernels.",
+      "gpu.memory": "GPU VRAM used vs total.",
+      "gpu.memctrl": "Memory-controller utilization — share of time the memory bus was busy. High here = memory-bandwidth bound.",
+      "gpu.temp": "GPU core temperature.",
+      "gpu.power": "Instantaneous power draw vs the configured power limit.",
+      "gpu.energy": "Cumulative energy used, integrated from power draw since the agent started.",
+      "gpu.fan": "GPU fan speed.",
+      "gpu.clocks": "Current SM clock and performance state (P0 = highest).",
+      "gpu.pcie": "Negotiated PCIe link generation and width (current / max).",
+      "gpu.driver": "Installed NVIDIA driver version.",
+      "gpu.ecc": "Uncorrected volatile ECC memory errors. Non-zero indicates failing memory.",
+      "gpu.throttle": "Active clock-throttle reasons (e.g. power cap, thermal). 'none' is healthy.",
+      // Docker card rows
+      "docker.status": "Container lifecycle state (running/exited/…), plus health-check status if defined.",
+      "docker.uptime": "How long the container has been running.",
+      "docker.restarts": "Number of times Docker has restarted this container.",
+      "docker.cpu": "Container CPU usage as a share of one core (can exceed 100% across cores).",
+      "docker.memory": "Container memory usage and % of its limit.",
+      "docker.exit": "Exit code of the last run (0 = clean, 137 = SIGKILL / OOM).",
+      "docker.oom": "Whether the container was killed by the kernel out-of-memory killer.",
+      // Serving model summary line
+      "srv.model": "The model id currently served by the engine.",
+      "srv.finished": "Total successfully completed requests since the engine started.",
+      "srv.prompt": "Lifetime total of prompt (input) tokens processed.",
+      "srv.output": "Lifetime total of generated (output) tokens.",
+      // Config
+      "cfg.container": "Name of the running inference container being inspected.",
+      "cfg.image": "Container image the engine runs from.",
+      "cfg.runtime": "Container runtime (e.g. nvidia) providing GPU access.",
+      "cfg.gpus": "GPU reservation granted to the container.",
+      "cfg.shm": "Shared-memory size — too small can break multi-GPU/tensor-parallel runs.",
+      "cfg.restart": "Docker restart policy for the container.",
+      "cfg.ports": "Published container ports.",
+      "cfg.volumes": "Mounted volumes/binds (e.g. the model cache).",
+      "cfg.args": "The exact engine arguments the server was launched with.",
+      // Host summary line
+      "host.uptime": "How long the host has been powered on (from /proc/uptime).",
+      "host.processes": "Number of processes on the host (count of /proc PIDs).",
+      "host.load": "Load average over 1 / 5 / 15 minutes. Compare to core count.",
+      // Docker daemon summary
+      "dmn.running": "Running containers out of total known to the daemon.",
+      "dmn.images": "Number of images stored locally.",
+      "dmn.cpus": "CPU cores visible to the Docker daemon.",
+      "dmn.ram": "Total host RAM reported by the Docker daemon.",
+      "dmn.version": "Docker Engine version.",
+      // GPU processes table
+      "gpu.proc": "Processes with memory allocated on the GPU (from nvidia-smi).",
+    };
+    const tip = (key) => (DEFS[key] ? ` title="${DEFS[key]}"` : "");
+
     function fmtUptime(s) {
       if (s == null) return "—";
       const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -184,6 +272,10 @@
       return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(b / 1e6).toFixed(0)} MB`;
     }
     function num(v, suffix = "") { return v == null ? "—" : `${v}${suffix}`; }
+    function fmtEnergy(wh) {
+      if (wh == null) return "—";
+      return wh >= 1000 ? (wh / 1000).toFixed(2) + " kWh" : wh.toFixed(0) + " Wh";
+    }
 
     function statusClass(status, health) {
       if (health === "unhealthy") return "bad";
@@ -201,7 +293,7 @@
 
     function stat(label, value, cls) {
       const small = String(value).length > 7 ? " sm" : "";
-      return `<div class="stat"><div class="label">${label}</div>
+      return `<div class="stat"${tip(label)}><div class="label">${label}</div>
         <div class="value${small} ${cls || ''}">${value}</div></div>`;
     }
     function group(title, cards) {
@@ -218,7 +310,7 @@
     function barTile(label, pct, detail, cls) {
       const p = pct == null ? 0 : pct;
       const barCls = p >= 90 ? "hot" : p >= 70 ? "warm" : "";
-      return `<div class="stat"><div class="label">${label}</div>
+      return `<div class="stat"${tip(label)}><div class="label">${label}</div>
         <div class="value sm ${cls || ''}">${pct == null ? "—" : p + "%"}</div>
         <div class="bar ${barCls}" style="margin-top:8px"><div style="width:${p}%"></div></div>
         <div class="label" style="margin:6px 0 0">${detail || ""}</div></div>`;
@@ -232,20 +324,33 @@
         return;
       }
       empty.textContent = "";
-      up.innerHTML = `<div>Uptime <b>${fmtUptime(h.uptime_seconds)}</b></div>
-        <div>Processes <b>${num(h.processes)}</b></div>
-        <div>Load <b>${h.load1 ?? "—"} · ${h.load5 ?? "—"} · ${h.load15 ?? "—"}</b></div>`;
+      up.innerHTML = `<div${tip("host.uptime")}>Uptime <b>${fmtUptime(h.uptime_seconds)}</b></div>
+        <div${tip("host.processes")}>Processes <b>${num(h.processes)}</b></div>
+        <div${tip("host.load")}>Load <b>${h.load1 ?? "—"} · ${h.load5 ?? "—"} · ${h.load15 ?? "—"}</b></div>`;
+      const memDetail = `${fmtBytes(h.mem_used)} / ${fmtBytes(h.mem_total)}`
+        + (h.mem_available != null ? ` · ${fmtBytes(h.mem_available)} avail` : "");
       const sys = [
         barTile("CPU", h.cpu_pct, h.load1 != null ? `load ${h.load1}` : ""),
-        barTile("Memory", h.mem_used_pct, `${fmtBytes(h.mem_used)} / ${fmtBytes(h.mem_total)}`),
+        barTile("Memory", h.mem_used_pct, memDetail),
         barTile("Swap", h.swap_used_pct, h.swap_total ? `${fmtBytes(h.swap_used)} / ${fmtBytes(h.swap_total)}` : "none"),
       ];
       const net = [
         stat("Net Rx", fmtRate(h.net_rx_bytes_per_sec)),
         stat("Net Tx", fmtRate(h.net_tx_bytes_per_sec)),
       ];
+      // NIC health (cumulative error/drop counters).
+      if (h.net_rx_errors != null) {
+        const errs = (h.net_rx_errors || 0) + (h.net_tx_errors || 0);
+        const drops = (h.net_rx_dropped || 0) + (h.net_tx_dropped || 0);
+        net.push(stat("Errors", String(errs), errs > 0 ? "warn" : ""));
+        net.push(stat("Dropped", String(drops), drops > 0 ? "warn" : ""));
+      }
       const disk = [];
       if (h.disk) disk.push(barTile("Disk /", h.disk.used_pct, `${fmtBytes(h.disk.free)} free of ${fmtBytes(h.disk.total)}`));
+      if (h.disk_read_bytes_per_sec != null) {
+        disk.push(stat("Disk read", fmtRate(h.disk_read_bytes_per_sec)));
+        disk.push(stat("Disk write", fmtRate(h.disk_write_bytes_per_sec)));
+      }
       (h.volumes || []).forEach((v) => disk.push(stat(v.name, fmtBytes(v.size))));
       root.innerHTML =
         group("System", sys) +
@@ -263,10 +368,10 @@
       }
       empty.textContent = "";
       const u = (x, s = "") => (x == null ? "—" : x + s);
-      model.innerHTML = `<div>Model <b>${v.model ?? "—"}</b></div>
-        <div>Finished requests <b>${v.requests_finished ?? "—"}</b></div>
-        <div>Total prompt tokens <b>${num(v.prompt_tokens_total)}</b></div>
-        <div>Total output tokens <b>${num(v.generation_tokens_total)}</b></div>`;
+      model.innerHTML = `<div${tip("srv.model")}>Model <b>${v.model ?? "—"}</b></div>
+        <div${tip("srv.finished")}>Finished requests <b>${v.requests_finished ?? "—"}</b></div>
+        <div${tip("srv.prompt")}>Total prompt tokens <b>${num(v.prompt_tokens_total)}</b></div>
+        <div${tip("srv.output")}>Total output tokens <b>${num(v.generation_tokens_total)}</b></div>`;
       const kv = v.kv_cache_usage_pct;
       const kvCls = kv >= 90 ? "bad" : kv >= 70 ? "warn" : "";
       const waitCls = v.requests_waiting > 0 ? "warn" : "";
@@ -284,6 +389,11 @@
           busy >= 90 ? "bad" : busy >= 70 ? "warn" : ""));
       }
       loadCards.push(stat("KV cache", u(kv, "%"), kvCls));
+      // vLLM-only: CPU-offload KV cache (only when swap space is enabled).
+      if (v.cpu_cache_usage_pct != null) {
+        loadCards.push(stat("CPU KV cache", v.cpu_cache_usage_pct + "%",
+          v.cpu_cache_usage_pct >= 90 ? "bad" : v.cpu_cache_usage_pct >= 70 ? "warn" : ""));
+      }
       loadCards.push(stat("Preemptions", num(v.preemptions_total), preemptCls));
       // NIM-only: explicit failed-request counter (vLLM leaves this null).
       if (v.requests_failed != null) {
@@ -296,19 +406,41 @@
           stat("Output", u(v.output_tokens_per_sec, " tok/s")),
           stat("Input", u(v.input_tokens_per_sec, " tok/s")),
         ]);
-      latrest.innerHTML =
-        group("Latency", [
-          stat("Time to first token", u(v.avg_ttft_ms, " ms")),
-          stat("Time between tokens", u(v.avg_inter_token_ms, " ms")),
-          stat("Total P50", u(v.latency_p50_s, " s")),
-          stat("Total P95", u(v.latency_p95_s, " s")),
-          stat("Total P99", u(v.latency_p99_s, " s")),
-        ]) +
-        group("Tokens & cache", [
-          stat("Avg prompt tokens/req", num(v.avg_prompt_tokens_per_req)),
-          stat("Avg output tokens/req", num(v.avg_output_tokens_per_req)),
-          stat("Prefix-cache hit rate", v.prefix_cache_hit_rate_pct == null ? "n/a" : v.prefix_cache_hit_rate_pct + "%"),
-        ]);
+      const latCards = [
+        stat("Time to first token", u(v.avg_ttft_ms, " ms")),
+        stat("Time between tokens", u(v.avg_inter_token_ms, " ms")),
+        stat("Total P50", u(v.latency_p50_s, " s")),
+        stat("Total P95", u(v.latency_p95_s, " s")),
+        stat("Total P99", u(v.latency_p99_s, " s")),
+      ];
+      // vLLM-only latency breakdown (null on NIM).
+      if (v.avg_queue_time_ms != null) latCards.push(stat("Queue", u(v.avg_queue_time_ms, " ms")));
+      if (v.avg_prefill_time_ms != null) latCards.push(stat("Prefill", u(v.avg_prefill_time_ms, " ms")));
+      if (v.avg_decode_time_s != null) latCards.push(stat("Decode", u(v.avg_decode_time_s, " s")));
+
+      const tokCards = [
+        stat("Avg prompt tokens/req", num(v.avg_prompt_tokens_per_req)),
+        stat("Avg output tokens/req", num(v.avg_output_tokens_per_req)),
+      ];
+      // Prefix-cache hit rate: only shown when the engine reports it (vLLM;
+      // NIM doesn't publish prefix-cache counters).
+      if (v.prefix_cache_hit_rate_pct != null) {
+        tokCards.push(stat("Prefix-cache hit rate", v.prefix_cache_hit_rate_pct + "%"));
+      }
+      if (v.finish_reasons) tokCards.push(finishTile(v.finish_reasons));
+
+      latrest.innerHTML = group("Latency", latCards) + group("Tokens & cache", tokCards);
+    }
+
+    function finishTile(fr) {
+      const total = Object.values(fr).reduce((a, b) => a + b, 0) || 1;
+      const rows = Object.entries(fr).sort((a, b) => b[1] - a[1])
+        .map(([k, n]) => `<div class="kv"><span>${k}</span><span>${n} (${Math.round(n / total * 100)}%)</span></div>`)
+        .join("");
+      // "length" = truncated at max_tokens; flag if it dominates.
+      const lenPct = (fr.length || 0) / total * 100;
+      const cls = lenPct >= 50 ? "warn" : "";
+      return `<div class="stat"${tip("Finish reasons")}><div class="label ${cls}">Finish reasons</div>${rows}</div>`;
     }
 
     function renderGpu(gpu) {
@@ -328,18 +460,20 @@
         return `<div class="card">
           <h3>GPU ${g.index}: ${g.name}</h3>
           <div class="sub">${g.uuid || ""}</div>
-          <div class="kv"><span>Compute</span><span>${num(util, "%")}</span></div>
+          <div class="kv"${tip("gpu.compute")}><span>Compute</span><span>${num(util, "%")}</span></div>
           <div class="bar"><div style="width:${util}%"></div></div>
-          <div class="kv"><span>Memory</span><span>${g["memory.used"]} / ${g["memory.total"]} MiB (${memPct}%)</span></div>
+          <div class="kv"${tip("gpu.memory")}><span>Memory</span><span>${g["memory.used"]} / ${g["memory.total"]} MiB (${memPct}%)</span></div>
           <div class="bar ${memCls}"><div style="width:${memPct}%"></div></div>
-          <div class="kv ${tempCls === "hot" ? "bad" : tempCls === "warm" ? "warn" : ""}"><span>Temp</span><span>${num(temp, "°C")}</span></div>
-          <div class="kv"><span>Power</span><span>${num(g["power.draw"], "W")} / ${num(g["power.limit"], "W")}</span></div>
-          <div class="kv"><span>Fan</span><span>${num(g["fan.speed"], "%")}</span></div>
-          <div class="kv"><span>Clocks</span><span>${num(g["clocks.sm"], " MHz")} sm · P-state ${g.pstate ?? "—"}</span></div>
-          <div class="kv"><span>PCIe</span><span>gen ${num(g["pcie.link.gen.current"])}/${num(g["pcie.link.gen.max"])} · x${num(g["pcie.link.width.current"])}</span></div>
-          <div class="kv"><span>Driver</span><span>${g.driver_version ?? "—"}</span></div>
-          <div class="kv ${g["ecc.errors.uncorrected.volatile.total"] ? "bad" : ""}"><span>ECC errors</span><span>${g["ecc.errors.uncorrected.volatile.total"] == null ? "n/a" : g["ecc.errors.uncorrected.volatile.total"]}</span></div>
-          <div class="kv"><span>Throttling</span><span class="${g.throttled ? "bad" : ""}">${g.throttling == null ? "—" : (g.throttled ? g.throttling.join(", ") : "none")}</span></div>
+          <div class="kv"${tip("gpu.memctrl")}><span>Mem controller</span><span>${num(g["utilization.memory"], "%")}</span></div>
+          <div class="kv ${tempCls === "hot" ? "bad" : tempCls === "warm" ? "warn" : ""}"${tip("gpu.temp")}><span>Temp</span><span>${num(temp, "°C")}</span></div>
+          <div class="kv"${tip("gpu.power")}><span>Power</span><span>${num(g["power.draw"], "W")} / ${num(g["power.limit"], "W")}</span></div>
+          <div class="kv"${tip("gpu.energy")}><span>Energy (since start)</span><span>${fmtEnergy(g.energy_wh)}</span></div>
+          <div class="kv"${tip("gpu.fan")}><span>Fan</span><span>${num(g["fan.speed"], "%")}</span></div>
+          <div class="kv"${tip("gpu.clocks")}><span>Clocks</span><span>${num(g["clocks.sm"], " MHz")} sm · P-state ${g.pstate ?? "—"}</span></div>
+          <div class="kv"${tip("gpu.pcie")}><span>PCIe</span><span>gen ${num(g["pcie.link.gen.current"])}/${num(g["pcie.link.gen.max"])} · x${num(g["pcie.link.width.current"])}</span></div>
+          <div class="kv"${tip("gpu.driver")}><span>Driver</span><span>${g.driver_version ?? "—"}</span></div>
+          <div class="kv ${g["ecc.errors.uncorrected.volatile.total"] ? "bad" : ""}"${tip("gpu.ecc")}><span>ECC errors</span><span>${g["ecc.errors.uncorrected.volatile.total"] == null ? "n/a" : g["ecc.errors.uncorrected.volatile.total"]}</span></div>
+          <div class="kv"${tip("gpu.throttle")}><span>Throttling</span><span class="${g.throttled ? "bad" : ""}">${g.throttling == null ? "—" : (g.throttled ? g.throttling.join(", ") : "none")}</span></div>
         </div>`;
       }).join("");
 
@@ -360,23 +494,24 @@
       empty.textContent = "";
       const info = d.daemon || {};
       daemon.innerHTML = `
-        <div>Running <b>${info.containers_running ?? "—"}</b> / ${info.containers_total ?? "—"}</div>
-        <div>Images <b>${info.images ?? "—"}</b></div>
-        <div>CPUs <b>${info.ncpu ?? "—"}</b></div>
-        <div>RAM <b>${fmtBytes(info.mem_total)}</b></div>
-        <div>Docker <b>${info.server_version ?? "—"}</b></div>`;
+        <div${tip("dmn.running")}>Running <b>${info.containers_running ?? "—"}</b> / ${info.containers_total ?? "—"}</div>
+        <div${tip("dmn.images")}>Images <b>${info.images ?? "—"}</b></div>
+        <div${tip("dmn.cpus")}>CPUs <b>${info.ncpu ?? "—"}</b></div>
+        <div${tip("dmn.ram")}>RAM <b>${fmtBytes(info.mem_total)}</b></div>
+        <div${tip("dmn.version")}>Docker <b>${info.server_version ?? "—"}</b></div>`;
       grid.innerHTML = (d.containers || []).map((c) => {
         const cls = statusClass(c.status, c.health);
         const health = c.health ? ` · ${c.health}` : "";
         return `<div class="card">
           <h3>${c.name}</h3>
           <div class="sub">${c.image}</div>
-          <div class="kv"><span>Status</span><span class="pill ${cls}"><span class="dot"></span>${c.status}${health}</span></div>
-          <div class="kv"><span>Uptime</span><span>${fmtUptime(c.uptime_seconds)}</span></div>
-          <div class="kv"><span>Restarts</span><span>${c.restart_count}</span></div>
-          ${c.stats ? `<div class="kv"><span>CPU</span><span>${num(c.stats.cpu_pct, "%")}</span></div>
-          <div class="kv"><span>Memory</span><span>${fmtBytes(c.stats.mem_used)}${c.stats.mem_pct != null ? ` (${c.stats.mem_pct}%)` : ""}</span></div>` : ""}
-          ${c.status !== "running" && c.exit_code != null ? `<div class="kv bad"><span>Exit code</span><span>${c.exit_code}</span></div>` : ""}
+          <div class="kv"${tip("docker.status")}><span>Status</span><span class="pill ${cls}"><span class="dot"></span>${c.status}${health}</span></div>
+          <div class="kv"${tip("docker.uptime")}><span>Uptime</span><span>${fmtUptime(c.uptime_seconds)}</span></div>
+          <div class="kv"${tip("docker.restarts")}><span>Restarts</span><span>${c.restart_count}</span></div>
+          ${c.stats ? `<div class="kv"${tip("docker.cpu")}><span>CPU</span><span>${num(c.stats.cpu_pct, "%")}</span></div>
+          <div class="kv"${tip("docker.memory")}><span>Memory</span><span>${fmtBytes(c.stats.mem_used)}${c.stats.mem_pct != null ? ` (${c.stats.mem_pct}%)` : ""}</span></div>` : ""}
+          ${c.status !== "running" && c.exit_code != null ? `<div class="kv bad"${tip("docker.exit")}><span>Exit code</span><span>${c.exit_code}</span></div>` : ""}
+          ${c.oom_killed ? `<div class="kv bad"${tip("docker.oom")}><span>OOM</span><span>killed</span></div>` : ""}
         </div>`;
       }).join("");
     }
@@ -396,12 +531,12 @@
       }
       empty.textContent = "";
       rt.innerHTML = `
-        <div>Container <b>${c.container}</b></div>
-        <div>Image <b>${c.image ?? "—"}</b></div>
-        <div>Runtime <b>${c.runtime ?? "—"}</b></div>
-        <div>GPUs <b>${c.gpus ?? "—"}</b></div>
-        <div>Shm <b>${fmtGiB(c.shm_size_bytes)}</b></div>
-        <div>Restart <b>${c.restart_policy || "—"}</b></div>`;
+        <div${tip("cfg.container")}>Container <b>${c.container}</b></div>
+        <div${tip("cfg.image")}>Image <b>${c.image ?? "—"}</b></div>
+        <div${tip("cfg.runtime")}>Runtime <b>${c.runtime ?? "—"}</b></div>
+        <div${tip("cfg.gpus")}>GPUs <b>${c.gpus ?? "—"}</b></div>
+        <div${tip("cfg.shm")}>Shm <b>${fmtGiB(c.shm_size_bytes)}</b></div>
+        <div${tip("cfg.restart")}>Restart <b>${c.restart_policy || "—"}</b></div>`;
       const ports = (c.ports || []).map((p) => `<code>${p}</code>`).join("<br>") || "—";
       const mounts = (c.mounts || []).map((m) => `<code>${m.source} → ${m.dest}</code> <span class="muted">(${m.type})</span>`).join("<br>") || "—";
       const args = c.engine_args || {};
@@ -413,9 +548,9 @@
         return `<tr><td><code>--${k}</code></td><td>${val}</td></tr>`;
       }).join("");
       box.innerHTML = `<div class="card">
-        <div class="kv"><span>Ports</span><span style="text-align:right">${ports}</span></div>
-        <div class="kv"><span>Volumes</span><span style="text-align:right">${mounts}</span></div>
-        <h3 style="margin:14px 0 6px;font-size:13px">Engine arguments</h3>
+        <div class="kv"${tip("cfg.ports")}><span>Ports</span><span style="text-align:right">${ports}</span></div>
+        <div class="kv"${tip("cfg.volumes")}><span>Volumes</span><span style="text-align:right">${mounts}</span></div>
+        <h3 style="margin:14px 0 6px;font-size:13px"${tip("cfg.args")}>Engine arguments</h3>
         <table>${rows || '<tr><td class="muted">none</td></tr>'}</table>
       </div>`;
     }

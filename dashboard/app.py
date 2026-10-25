@@ -14,6 +14,7 @@ Config via env:
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -21,6 +22,17 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+
+class _SkipStatusPolls(logging.Filter):
+    """Drop the frequent /api/status access-log lines (dashboard polling);
+    other requests (/, /api/analyze, errors) still log normally."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/status" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_SkipStatusPolls())
 
 AGENT_URL = os.environ.get("AGENT_URL", "").rstrip("/")
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
