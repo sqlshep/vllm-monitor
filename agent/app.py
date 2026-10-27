@@ -430,6 +430,189 @@ def _histogram_quantile(parsed: dict, name: str, q: float) -> float | None:
 # Previous sample for computing token throughput (rate) between scrapes.
 _vllm_prev: dict[str, float] = {}
 
+# TensorRT-LLM state. trtllm-serve's /metrics is a JSON buffer of per-iteration
+# stats that DRAINS on each read, so we accumulate token/request totals across
+# scrapes to synthesize the cumulative counters the dashboard expects.
+_trt_cum: dict[str, float] = {}
+_trt_model: dict[str, str | None] = {}
+# Rolling window of per-request latency samples drained from /perf_metrics
+# (which also empties on read), used to compute live latency percentiles.
+_trt_perf: list[dict[str, float]] = []
+_TRT_PERF_MAX = 500
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    """Linear-interpolated percentile over a raw sample list (q in 0..1)."""
+    if not values:
+        return None
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    pos = q * (len(s) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def _trt_perf_url() -> str:
+    """trtllm-serve's per-request perf endpoint, derived from the metrics URL."""
+    u = VLLM_METRICS_URL
+    for suffix in ("/v1/metrics", "/metrics"):
+        if u.endswith(suffix):
+            return u[: -len(suffix)] + "/perf_metrics"
+    return u.rstrip("/") + "/perf_metrics"
+
+
+def _trt_update_perf() -> None:
+    """Drain trtllm-serve's /perf_metrics buffer (per-request, populated on
+    completion; empties on read) and push normalized latency samples — TTFT,
+    end-to-end, queue, prefill, decode, time-per-output-token — into a rolling
+    window. All timing_metrics values share one engine clock, in seconds."""
+    try:
+        req = urllib.request.Request(_trt_perf_url(), headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            records = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(records, list):
+        return
+    for r in records:
+        pm = (r or {}).get("perf_metrics") or {}
+        tm = pm.get("timing_metrics") or {}
+        arr, sched = tm.get("arrival_time"), tm.get("first_scheduled_time")
+        ftt, ltt = tm.get("first_token_time"), tm.get("last_token_time")
+        if arr is None or ftt is None or ltt is None:
+            continue
+        ntok = max((pm.get("last_iter") or 0) - (pm.get("first_iter") or 0), 0) + 1
+        decode = max(ltt - ftt, 0.0)
+        _trt_perf.append({
+            "ttft": max(ftt - arr, 0.0),
+            "e2e": max(ltt - arr, 0.0),
+            "decode": decode,
+            "queue": max(sched - arr, 0.0) if sched is not None else 0.0,
+            "prefill": max(ftt - sched, 0.0) if sched is not None else 0.0,
+            "tpot": decode / (ntok - 1) if ntok > 1 else 0.0,
+            "ntok": float(ntok),
+        })
+    if len(_trt_perf) > _TRT_PERF_MAX:
+        del _trt_perf[: len(_trt_perf) - _TRT_PERF_MAX]
+
+
+def _collect_trtllm(iters: list, url: str) -> dict[str, Any]:
+    """Map NVIDIA TensorRT-LLM (`trtllm-serve`) `/metrics` iteration stats into
+    the same serving schema the dashboard renders for vLLM/NIM.
+
+    The endpoint returns a JSON list of per-iteration snapshots accumulated
+    since the previous read (the buffer drains), so we use the most recent
+    iteration for live gauges and sum across the batch for throughput and the
+    cumulative token/request counters. Fields with no TRT-LLM equivalent are
+    left ``None`` so the UI hides those tiles (same as the NIM path)."""
+    # Aggregate token/request flow + decode-step timing across the batch.
+    gen_tok = ctx_tok = 0.0
+    completed = 0
+    iter_time_s = 0.0
+    itt_sum = 0.0            # inter-token (decode-step) latency accumulator
+    itt_n = 0
+    last = None
+    for it in iters:
+        ib = it.get("inflightBatchingStats") or {}
+        ngen = ib.get("numGenRequests") or 0
+        # Standard autoregressive decoding emits 1 token per active generation
+        # request per iteration; avgNumDecodedTokensPerIter is only > 1 with
+        # speculative decoding (and is reported as 0.0 otherwise), so floor it
+        # at 1 token/request so throughput isn't stuck at zero.
+        avg_dec = ib.get("avgNumDecodedTokensPerIter") or 0.0
+        gen_tok += ngen * max(avg_dec, 1.0)
+        ctx_tok += ib.get("numCtxTokens") or 0
+        completed += it.get("numCompletedRequests") or 0
+        lat = it.get("iterLatencyMS") or 0.0
+        iter_time_s += lat / 1000.0
+        if ngen > 0:
+            # One decode iteration ≈ time between tokens for active requests.
+            itt_sum += lat / max(avg_dec, 1.0)
+            itt_n += 1
+        last = it
+
+    # Cumulative counters (buffer drains → summing each batch = running total).
+    _trt_cum["gen"] = _trt_cum.get("gen", 0.0) + gen_tok
+    _trt_cum["prompt"] = _trt_cum.get("prompt", 0.0) + ctx_tok
+    _trt_cum["completed"] = _trt_cum.get("completed", 0.0) + completed
+
+    # Model id (cached; one lightweight /v1/models lookup).
+    if "id" not in _trt_model:
+        _trt_model["id"] = _discover_model(_openai_base())
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "model": _trt_model.get("id"),
+        "input_tokens_per_sec": round(ctx_tok / iter_time_s, 1) if iter_time_s > 0 else 0.0,
+        "output_tokens_per_sec": round(gen_tok / iter_time_s, 1) if iter_time_s > 0 else 0.0,
+        "avg_inter_token_ms": round(itt_sum / itt_n, 1) if itt_n else None,
+        "prompt_tokens_total": round(_trt_cum["prompt"]),
+        "generation_tokens_total": round(_trt_cum["gen"]),
+        "requests_finished": int(_trt_cum["completed"]),
+        # vLLM-only fields with no TRT-LLM iteration-stat equivalent → hidden.
+        "avg_ttft_ms": None,
+        "latency_p50_s": None,
+        "latency_p95_s": None,
+        "latency_p99_s": None,
+        "ttft_p95_ms": None,
+        "avg_queue_time_ms": None,
+        "avg_prefill_time_ms": None,
+        "avg_decode_time_s": None,
+        "preemptions_total": None,
+        "cpu_cache_usage_pct": None,
+        "avg_prompt_tokens_per_req": None,
+        "avg_output_tokens_per_req": None,
+        "finish_reasons": None,
+        "requests_failed": None,
+    }
+
+    if last is None:
+        # Empty batch → the server has been idle since the last scrape.
+        out.update({
+            "requests_running": 0,
+            "requests_waiting": 0,
+            "kv_cache_usage_pct": None,
+            "max_concurrent": None,
+            "prefix_cache_hit_rate_pct": None,
+        })
+    else:
+        kv = last.get("kvCacheStats") or {}
+        max_blocks = kv.get("maxNumBlocks") or 0
+        used_blocks = kv.get("usedNumBlocks") or 0
+        hit_rate = kv.get("cacheHitRate")
+        out.update({
+            "requests_running": last.get("numActiveRequests"),
+            "requests_waiting": last.get("numQueuedRequests"),
+            "kv_cache_usage_pct": round(used_blocks / max_blocks * 100, 1) if max_blocks else None,
+            "max_concurrent": last.get("maxNumActiveRequests"),
+            "prefix_cache_hit_rate_pct": round(hit_rate * 100, 1) if hit_rate is not None else None,
+        })
+
+    # Per-request latency from /perf_metrics (rolling window of completed reqs).
+    _trt_update_perf()
+    if _trt_perf:
+        mean = lambda xs: sum(xs) / len(xs)  # noqa: E731
+        ttfts = [s["ttft"] for s in _trt_perf]
+        e2es = [s["e2e"] for s in _trt_perf]
+        tpots = [s["tpot"] for s in _trt_perf if s["tpot"] > 0]
+        out.update({
+            "avg_ttft_ms": round(mean(ttfts) * 1000, 1),
+            "ttft_p95_ms": round(_percentile(ttfts, 0.95) * 1000, 1),
+            "latency_p50_s": round(_percentile(e2es, 0.50), 3),
+            "latency_p95_s": round(_percentile(e2es, 0.95), 3),
+            "latency_p99_s": round(_percentile(e2es, 0.99), 3),
+            "avg_queue_time_ms": round(mean([s["queue"] for s in _trt_perf]) * 1000, 1),
+            "avg_prefill_time_ms": round(mean([s["prefill"] for s in _trt_perf]) * 1000, 1),
+            "avg_decode_time_s": round(mean([s["decode"] for s in _trt_perf]), 3),
+            "avg_output_tokens_per_req": round(mean([s["ntok"] for s in _trt_perf])),
+        })
+        if tpots:  # per-request TPOT is more accurate than the iteration proxy
+            out["avg_inter_token_ms"] = round(mean(tpots) * 1000, 1)
+
+    return out
+
 
 def _vllm_metric_urls() -> list[str]:
     """Configured URL plus the alternate path, so we auto-detect both vLLM
@@ -453,6 +636,18 @@ def collect_vllm() -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             last_err = f"could not scrape {url}: {exc}"
             continue
+        # TensorRT-LLM (trtllm-serve) exposes a JSON iteration-stats buffer at
+        # /metrics instead of Prometheus text. Detect it and adapt. An empty
+        # list ([]) is valid — it means the server has been idle since the last
+        # scrape — so we still return a (zeroed) snapshot rather than falling
+        # through to the Prometheus parser.
+        if text.lstrip()[:1] == "[":
+            try:
+                data = json.loads(text)
+            except Exception:  # noqa: BLE001
+                data = None
+            if isinstance(data, list):
+                return _collect_trtllm(data, url)
         candidate = _parse_prometheus(text)
         # Accept the endpoint only if it actually carries serving metrics
         # (prefix-agnostic), so a 404 body or wrong port is rejected.

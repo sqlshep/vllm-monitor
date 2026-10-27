@@ -1,13 +1,18 @@
 # LLM Server Monitor
 
 **LLM Server Monitor is a lightweight, self-hosted observability tool for a GPU
-server running an LLM inference engine in Docker — [vLLM](https://github.com/vllm-project/vllm)
-or [NVIDIA NIM](https://developer.nvidia.com/nim).** It gives you a single pane of
-glass over the whole inference stack — the model server, the GPU, the containers,
-and the host machine — without the weight of a full Prometheus + Grafana deployment.
+server running an LLM inference engine in Docker — [vLLM](https://github.com/vllm-project/vllm),
+[NVIDIA NIM](https://developer.nvidia.com/nim), or
+[NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).** It gives you a
+single pane of glass over the whole inference stack — the model server, the GPU,
+the containers, and the host machine — without the weight of a full
+Prometheus + Grafana deployment.
 
-The engine is **auto-detected**: point it at a box running vLLM or NIM and the
-dashboard labels itself accordingly (both expose the same vLLM-family metrics).
+The engine is **auto-detected**: point it at a box running vLLM, NIM, or
+TensorRT-LLM and the dashboard labels itself accordingly. vLLM and NIM expose the
+same Prometheus metrics; TensorRT-LLM (`trtllm-serve`) publishes JSON stats
+instead, which the agent adapts into the same schema (see
+[TensorRT-LLM support](#tensorrt-llm-support)).
 
 Running an LLM on a cloud GPU instance leaves you with blind spots: Is the server
 keeping up, or is a request queue forming? Is the GPU actually busy, or silently
@@ -34,7 +39,7 @@ the whole thing is a couple hundred lines of Python plus a static HTML page.
 - **Docker** — container health/status plus per-container CPU/memory
 - **✨ AI analysis** — one click sends the live snapshot to the monitored model itself and returns a plain-English health assessment
 
-![LLM Server Monitor dashboard](docs/dashboard.png?v=4)
+![LLM Server Monitor dashboard](docs/dashboard.png?v=5)
 
 ---
 
@@ -55,12 +60,12 @@ flowchart LR
         docker[("Docker daemon")]
         gpu["NVIDIA GPU"]
         host["Host kernel<br/>/proc · /host"]
-        engine["Inference engine :8000<br/>vLLM or NVIDIA NIM<br/>(auto-detected)"]
+        engine["Inference engine :8000<br/>vLLM · NVIDIA NIM · TensorRT-LLM<br/>(auto-detected)"]
 
         agent -->|"docker.sock (ro)"| docker
         agent -->|"nvidia-smi"| gpu
         agent -->|"read /proc, /host (ro)"| host
-        agent -->|"scrape /metrics<br/>or /v1/metrics"| engine
+        agent -->|"scrape /metrics or /v1/metrics<br/>(Prometheus or TRT-LLM JSON)"| engine
     end
 
     dashboard ==>|"GET /api/all · Bearer token · HTTP :9100"| agent
@@ -82,8 +87,8 @@ only client, polling it with a bearer token over the public IP.
 |---|---|---|
 | **Docker** containers + per-container stats | Docker SDK via the mounted `/var/run/docker.sock` (read-only) | The socket is local to the host. |
 | **GPU** stats, throttle, ECC, PCIe, processes | Runs `nvidia-smi` | Needs the GPU + driver, injected by the NVIDIA Container Toolkit. |
-| **Serving** metrics (vLLM / NIM) | Scrapes the engine's Prometheus endpoint (`/metrics` for vLLM, `/v1/metrics` for NIM — both auto-tried) | The engine binds to `127.0.0.1:8000`; reachable only via host networking. |
-| **Serving** config | `docker inspect` on the running inference container | Reads the actual launched command + runtime flags; the engine (vLLM/NIM/…) is auto-detected from the image. |
+| **Serving** metrics (vLLM / NIM / TensorRT-LLM) | Scrapes the engine's metrics endpoint (`/metrics` or `/v1/metrics` — both auto-tried). Prometheus text for vLLM/NIM; TensorRT-LLM's JSON iteration + per-request stats are adapted into the same schema. | The engine binds to `127.0.0.1:8000`; reachable only via host networking. |
+| **Serving** config | `docker inspect` on the running inference container | Reads the actual launched command + runtime flags; the engine (vLLM/NIM/TensorRT-LLM/…) is auto-detected from the image. |
 | **Host** CPU / mem / net / uptime | Reads `/proc` | Host-visible because the container shares the host PID namespace. |
 | **Host** disk usage | `statvfs` on a read-only bind mount of `/` at `/host` | The container's own filesystem isn't the host's. |
 
@@ -136,14 +141,14 @@ NvidiaPrep/
 | `GET /api/host` | Bearer | CPU, load, RAM/swap, disk, network, uptime, volume sizes |
 | `GET /api/gpu` | Bearer | Per-GPU utilization/memory/temp/power/clocks/PCIe/throttle/ECC + compute apps |
 | `GET /api/docker` | Bearer | Daemon info + containers (status/health + per-container CPU/mem/net) |
-| `GET /api/vllm` | Bearer | Serving metrics — vLLM or NIM (throughput, latency percentiles, KV/prefix cache, …) |
+| `GET /api/vllm` | Bearer | Serving metrics — vLLM, NIM, or TensorRT-LLM (throughput, latency percentiles, KV/prefix cache, …) |
 | `GET /api/vllm-config` | Bearer | Serving container launch config (engine args + runtime flags; engine auto-detected) |
 | `GET /api/all` | Bearer | Combined snapshot — what the dashboard consumes |
 | `POST /api/analyze` | Bearer | Sends the live snapshot to the monitored engine (`/v1/chat/completions`) and returns its analysis |
 
 ### Metrics reference
 
-**Serving (vLLM / NIM)** — requests running/waiting, KV-cache % (+ CPU-offload
+**Serving (vLLM / NIM / TensorRT-LLM)** — requests running/waiting, KV-cache % (+ CPU-offload
 KV % when enabled), input/output tokens/sec, avg TTFT, inter-token latency, total
 latency P50/P95/P99, vLLM-only latency breakdown (queue / prefill / decode),
 preemptions, prefix-cache hit rate, avg prompt/output tokens per request, lifetime
@@ -246,6 +251,39 @@ docker restart vllm-monitor-agent
 - The **inference container** (vLLM/NIM) does **not** auto-start if its restart policy is `no` — start it manually.
 - If the instance uses an **ephemeral external IP**, it changes on restart — update
   `AGENT_URL` in `.env` and bring the dashboard back up. (Reserve a static IP to avoid this.)
+
+---
+
+## TensorRT-LLM support
+
+TensorRT-LLM (`trtllm-serve`) is auto-detected and adapted, but unlike vLLM/NIM it
+differs in two ways:
+
+- **Format:** its `/metrics` endpoint returns **JSON** (per-iteration runtime
+  stats), not Prometheus text, and `/perf_metrics` returns per-request timing.
+  Both are *draining* buffers (each read empties them), so the agent keeps a small
+  rolling window to compute live throughput and latency percentiles. The agent
+  maps all of this into the same serving schema vLLM/NIM use — no dashboard change.
+- **Disabled by default:** the stats collectors are off unless you enable them at
+  launch via an `--extra_llm_api_options` (a.k.a. `--config`) YAML:
+
+  ```yaml
+  enable_iter_perf_stats: true    # fills /metrics (running/queued reqs, KV usage, throughput)
+  return_perf_metrics: true       # fills /perf_metrics (TTFT, inter-token, latency percentiles)
+  perf_metrics_max_requests: 1000 # retention buffer for per-request perf metrics
+  ```
+
+  ```bash
+  trtllm-serve serve <model> ... --extra_llm_api_options /opt/trtllm_extra.yaml
+  ```
+
+  Without `enable_iter_perf_stats`, the serving tiles stay empty; without
+  `return_perf_metrics` (+ a non-zero `perf_metrics_max_requests`), the latency
+  tiles stay empty. Note `/perf_metrics` only fills as requests **complete**.
+
+Fields TensorRT-LLM doesn't expose (finish-reason breakdown, explicit
+failed-request counter, CPU-offload KV, preemptions) are returned as `null`, so
+the dashboard simply hides those tiles — the same way it does for NIM.
 
 ---
 
