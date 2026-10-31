@@ -88,6 +88,7 @@
     <span id="conn" class="pill muted"><span class="dot"></span>connecting…</span>
     <div class="spacer"></div>
     <button id="analyze-btn" class="btn" title="Ask the monitored model to analyze the live snapshot">✨ Analyze</button>
+    <button id="clear-btn" class="btn" title="Clear the dashboard history charts (client-side only; does not affect the server)">Clear stats</button>
     <label class="meta">refresh
       <select id="interval">
         <option value="3000">3s</option>
@@ -113,7 +114,7 @@
     </div>
 
     <section>
-      <h2 id="vllm-title">vLLM</h2>
+      <h2 id="vllm-title">LLM</h2>
       <div id="vllm-model" class="daemon-stats"></div>
       <div id="vllm-load"></div>
       <div id="vllm-chart-wrap" class="subgroup" style="display:none">
@@ -178,21 +179,21 @@
       // Serving
       "Requests running": "Requests being processed on the GPU right now.",
       "Requests waiting": "Requests queued for a scheduler slot. A growing queue means the server is saturated.",
-      "Max concurrent": "Configured max concurrent requests the engine will run (NIM). The % is current running ÷ this capacity.",
+      "Max concurrent": "Configured max concurrent requests the engine will run. The % is current running ÷ this capacity.",
       "KV cache": "Share of the GPU KV-cache (attention key/value memory) in use. Near 100% forces preemptions.",
-      "CPU KV cache": "Share of CPU-offload KV cache in use (only when vLLM swap space is enabled).",
+      "CPU KV cache": "Share of CPU-offload KV cache in use (only when CPU KV-cache offload is enabled).",
       "Preemptions": "Cumulative requests the scheduler paused and recomputed due to KV-cache pressure.",
-      "Failed requests": "Cumulative requests that errored (NIM).",
+      "Failed requests": "Cumulative requests that errored.",
       "Output": "Output (generated) token throughput in tokens/sec, measured between refreshes.",
       "Input": "Input (prompt) token throughput in tokens/sec, measured between refreshes.",
       "Time to first token": "Average time from request arrival to the first generated token (TTFT).",
       "Time between tokens": "Average inter-token latency — time between consecutive generated tokens.",
-      "Total P50": "Median (50th percentile) end-to-end request latency, estimated from histogram buckets.",
-      "Total P95": "95th-percentile end-to-end request latency, estimated from histogram buckets.",
-      "Total P99": "99th-percentile end-to-end request latency, estimated from histogram buckets.",
-      "Queue": "Average time requests spend waiting in the scheduler queue (vLLM).",
-      "Prefill": "Average time spent in the prefill phase processing the prompt (vLLM).",
-      "Decode": "Average time spent in the decode phase generating tokens (vLLM).",
+      "Total P50": "Median (50th percentile) end-to-end request latency.",
+      "Total P95": "95th-percentile end-to-end request latency.",
+      "Total P99": "99th-percentile end-to-end request latency.",
+      "Queue": "Average time requests spend waiting in the scheduler queue.",
+      "Prefill": "Average time spent in the prefill phase processing the prompt.",
+      "Decode": "Average time spent in the decode phase generating tokens.",
       "Avg prompt tokens/req": "Average number of prompt (input) tokens per request.",
       "Avg output tokens/req": "Average number of generated (output) tokens per request.",
       "Prefix-cache hit rate": "Share of prompt tokens served from the prefix cache (higher = more reuse).",
@@ -363,7 +364,7 @@
             thpt = $("vllm-throughput"), latrest = $("vllm-latrest"), empty = $("vllm-empty");
       if (!v || !v.ok) {
         model.innerHTML = ""; load.innerHTML = ""; thpt.innerHTML = ""; latrest.innerHTML = "";
-        empty.textContent = v && v.error ? `vLLM: ${v.error}` : "No vLLM data.";
+        empty.textContent = v && v.error ? `Serving: ${v.error}` : "No serving data.";
         return;
       }
       empty.textContent = "";
@@ -797,6 +798,15 @@
     }
     $("analyze-btn").addEventListener("click", analyze);
     $("analysis-close").addEventListener("click", () => { $("analysis").style.display = "none"; });
+
+    // Clear the client-side history charts (does not touch server state).
+    function clearStats() {
+      vllmHistory.length = 0;   // drop all accumulated refresh ticks
+      vllmPrevFailed = null;    // restart the failed-request delta baseline
+      drawVllmChart();          // both charts hide themselves when < 2 points remain
+      drawThptChart();
+    }
+    $("clear-btn").addEventListener("click", clearStats);
 
     $("interval").addEventListener("change", restart);
     let resizeTimer = null;

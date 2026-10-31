@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 import time
@@ -825,6 +826,19 @@ def collect_vllm_config() -> dict[str, Any]:
 
         # Parse engine args from entrypoint + cmd into key/value pairs.
         tokens = list(cfg.get("Entrypoint") or []) + list(cfg.get("Cmd") or [])
+        # Unwrap a shell wrapper like `bash -c "<script with the real server
+        # command>"` (how the TensorRT-LLM image is commonly launched). The
+        # actual `trtllm-serve … --flags` live inside that single string, so we
+        # re-tokenize the script; otherwise no `--flag` tokens are visible.
+        if "-c" in tokens:
+            ci = tokens.index("-c")
+            shell = os.path.basename(str(tokens[ci - 1])) if ci >= 1 else ""
+            script = tokens[ci + 1] if ci + 1 < len(tokens) else None
+            if shell in ("sh", "bash", "dash", "ash") and isinstance(script, str):
+                try:
+                    tokens = shlex.split(script)
+                except Exception:  # noqa: BLE001
+                    pass  # keep the original tokens if the script won't parse
         engine_args: dict[str, Any] = {}
         i = 0
         while i < len(tokens):
